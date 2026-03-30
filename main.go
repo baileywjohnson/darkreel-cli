@@ -96,6 +96,17 @@ func cmdUpload() {
 		}
 	}
 
+	// Fall back to environment variables for credentials (avoids exposure in ps aux)
+	if serverURL == "" {
+		serverURL = strings.TrimRight(os.Getenv("DRK_SERVER"), "/")
+	}
+	if username == "" {
+		username = os.Getenv("DRK_USER")
+	}
+	if password == "" {
+		password = os.Getenv("DRK_PASS")
+	}
+
 	if serverURL == "" || username == "" || password == "" {
 		fmt.Fprintln(os.Stderr, "Error: -server, -user, and -pass are required")
 		os.Exit(1)
