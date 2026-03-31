@@ -270,22 +270,32 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		return err
 	}
 
-	// Encrypt filename
-	encName, err := crypto.EncryptBlock([]byte(filepath.Base(filePath)), masterKey)
+	// Build and encrypt the metadata blob (name, type, mime, size, etc.)
+	metadataPlain, err := json.Marshal(map[string]any{
+		"name":       filepath.Base(filePath),
+		"media_type": mediaType,
+		"mime_type":  mimeType,
+		"size":       info.Size(),
+	})
 	if err != nil {
 		return err
 	}
+	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey)
+	if err != nil {
+		return err
+	}
+	// EncryptBlock returns nonce || ciphertext || tag. Split nonce (first 12 bytes) from rest.
+	metadataNonce := metadataEnc[:12]
+	metadataCiphertext := metadataEnc[12:]
 
-	// Build metadata
+	// Build upload metadata
 	meta := map[string]any{
-		"name":          base64.StdEncoding.EncodeToString(encName),
-		"media_type":    mediaType,
-		"mime_type":     mimeType,
-		"size":          info.Size(),
-		"chunk_count":   chunkCount,
-		"file_key_enc":  base64.StdEncoding.EncodeToString(encFileKey),
-		"thumb_key_enc": base64.StdEncoding.EncodeToString(encThumbKey),
-		"hash_nonce":    base64.StdEncoding.EncodeToString(hashNonce),
+		"chunk_count":    chunkCount,
+		"file_key_enc":   base64.StdEncoding.EncodeToString(encFileKey),
+		"thumb_key_enc":  base64.StdEncoding.EncodeToString(encThumbKey),
+		"hash_nonce":     base64.StdEncoding.EncodeToString(hashNonce),
+		"metadata_enc":   base64.StdEncoding.EncodeToString(metadataCiphertext),
+		"metadata_nonce": base64.StdEncoding.EncodeToString(metadataNonce),
 	}
 
 	// Build multipart body
