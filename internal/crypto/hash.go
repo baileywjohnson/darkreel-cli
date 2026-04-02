@@ -118,12 +118,8 @@ func modifyMP4(data []byte, nonce []byte) ([]byte, error) {
 		return nil, fmt.Errorf("not a valid MP4")
 	}
 
-	pos := 0
-	if len(data) >= 8 && string(data[4:8]) == "ftyp" {
-		boxSize := binary.BigEndian.Uint32(data[0:4])
-		pos = int(boxSize)
-	}
-
+	// Append a 'free' box at the END of the file.
+	// Inserting before moov would corrupt stco/co64 byte offsets.
 	boxSize := uint32(8 + len(nonce))
 	freeBox := make([]byte, boxSize)
 	binary.BigEndian.PutUint32(freeBox[0:4], boxSize)
@@ -131,9 +127,8 @@ func modifyMP4(data []byte, nonce []byte) ([]byte, error) {
 	copy(freeBox[8:], nonce)
 
 	result := make([]byte, 0, len(data)+len(freeBox))
-	result = append(result, data[:pos]...)
+	result = append(result, data...)
 	result = append(result, freeBox...)
-	result = append(result, data[pos:]...)
 	return result, nil
 }
 
