@@ -272,10 +272,11 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 
 	// Build and encrypt the metadata blob (name, type, mime, size, etc.)
 	metadataPlain, err := json.Marshal(map[string]any{
-		"name":       filepath.Base(filePath),
-		"media_type": mediaType,
-		"mime_type":  mimeType,
-		"size":       info.Size(),
+		"name":        filepath.Base(filePath),
+		"media_type":  mediaType,
+		"mime_type":   mimeType,
+		"size":        info.Size(),
+		"chunk_count": chunkCount,
 	})
 	if err != nil {
 		return err

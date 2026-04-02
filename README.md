@@ -61,7 +61,7 @@ Flags:
   -server    Darkreel server URL (e.g., https://media.example.com)
   -user      Username
   -pass      Password
-  -register  Register a new account before uploading
+  -register  Register a new account before uploading (requires ALLOW_REGISTRATION=true on the server)
 ```
 
 ### Environment variables
@@ -98,20 +98,20 @@ darkreel-cli upload ~/Photos/*.jpg
 ## What happens during upload
 
 1. Authenticates with the Darkreel server (registers first if `-register` is set)
-2. Derives master key from your password using PBKDF2-SHA256 (100k iterations)
+2. Receives the master key encrypted with a PBKDF2-derived session key, decrypts it client-side
 3. For each file:
    - Reads the file
    - Injects random metadata to modify the file hash (without affecting playback)
    - Generates a 320px JPEG thumbnail
    - Generates random 256-bit encryption keys for file and thumbnail
-   - Encrypts metadata (name, type, MIME, size, dimensions, duration) into a single blob with the master key
+   - Encrypts metadata (name, type, MIME, size, chunk count) into a single blob with the master key
    - Splits the file into 1 MB chunks
    - Encrypts each chunk with AES-256-GCM (chunk index as AAD)
    - Encrypts the thumbnail
    - Encrypts the file/thumbnail keys with your master key
    - Uploads everything via multipart POST
 
-The server only ever receives encrypted data and an encrypted metadata blob.
+The server only ever receives encrypted data and an encrypted metadata blob. File names, types, sizes, and dimensions are never visible to the server.
 
 ## Hash modification
 
@@ -121,7 +121,7 @@ When a file is encrypted, a random 32-byte nonce is injected into the file's met
 |--------|--------|
 | JPEG | Inserts a COM (comment) marker after SOI |
 | PNG | Inserts a tEXt chunk before IDAT |
-| MP4 | Inserts a "free" box after ftyp |
+| MP4 | Appends a "free" box at end of file |
 | WebM | Appends marker bytes |
 | Other | Appends marker bytes |
 
