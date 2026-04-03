@@ -116,6 +116,15 @@ func cmdUpload() {
 		os.Exit(1)
 	}
 
+	// Warn when using plaintext HTTP for non-localhost URLs
+	if strings.HasPrefix(serverURL, "http://") &&
+		!strings.HasPrefix(serverURL, "http://localhost") &&
+		!strings.HasPrefix(serverURL, "http://127.0.0.1") &&
+		!strings.HasPrefix(serverURL, "http://[::1]") {
+		fmt.Fprintln(os.Stderr, "WARNING: Using plaintext HTTP. Credentials and encryption keys will be sent unencrypted.")
+		fmt.Fprintln(os.Stderr, "         Use HTTPS for production deployments.")
+	}
+
 	client := &http.Client{}
 
 	// Register if requested
@@ -153,7 +162,7 @@ func cmdUpload() {
 	resp.Body.Close()
 
 	// Derive master key: decrypt the encrypted master key from server
-	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password)
+	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password, loginResp.KDFSalt)
 	if err != nil {
 		fatal("failed to decrypt master key: %v", err)
 	}
@@ -179,12 +188,16 @@ func cmdUpload() {
 	}
 }
 
-func decryptMasterKey(encB64, password string) ([]byte, error) {
+func decryptMasterKey(encB64, password, kdfSaltB64 string) ([]byte, error) {
 	encData, err := base64.StdEncoding.DecodeString(encB64)
 	if err != nil {
 		return nil, err
 	}
-	sessionKey := pbkdf2.Key([]byte(password), []byte("darkreel-session-key"), 100000, 32, sha256.New)
+	kdfSalt, err := base64.StdEncoding.DecodeString(kdfSaltB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid kdf_salt: %w", err)
+	}
+	sessionKey := pbkdf2.Key([]byte(password), kdfSalt, 600000, 32, sha256.New)
 	defer zeroBytes(sessionKey)
 
 	return crypto.DecryptBlock(encData, sessionKey)
@@ -398,8 +411,14 @@ func generateVideoThumbnail(filePath string) []byte {
 		return placeholderThumb()
 	}
 
-	tmpFile := filepath.Join(os.TempDir(), "drk-thumb.jpg")
-	defer os.Remove(tmpFile)
+	tmpFile, err := os.CreateTemp("", "drk-thumb-*.jpg")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n    (failed to create temp file — using placeholder thumbnail)\n    ")
+		return placeholderThumb()
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
 
 	cmd := exec.Command(ffmpeg,
 		"-i", filePath,
@@ -408,7 +427,7 @@ func generateVideoThumbnail(filePath string) []byte {
 		"-vf", "scale=320:-1",
 		"-q:v", "5",
 		"-y",
-		tmpFile,
+		tmpPath,
 	)
 	cmd.Stderr = nil
 	cmd.Stdout = nil
@@ -418,7 +437,7 @@ func generateVideoThumbnail(filePath string) []byte {
 		return placeholderThumb()
 	}
 
-	data, err := os.ReadFile(tmpFile)
+	data, err := os.ReadFile(tmpPath)
 	if err != nil {
 		return placeholderThumb()
 	}
