@@ -168,21 +168,21 @@ func cmdUpload() {
 	}
 	defer zeroBytes(masterKey)
 
-	fmt.Printf("Authenticated. Uploading %d file(s)...\n\n", len(files))
+	fmt.Fprintf(os.Stderr, "Authenticated. Uploading %d file(s)...\n\n", len(files))
 
 	success, fail := 0, 0
 	for _, f := range files {
-		fmt.Printf("  %s ", filepath.Base(f))
+		fmt.Fprintf(os.Stderr, "  file %d/%d ", success+fail+1, len(files))
 		if err := uploadFile(client, serverURL, loginResp.Token, masterKey, f); err != nil {
-			fmt.Printf("FAILED: %v\n", err)
+			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
 		} else {
-			fmt.Println("OK")
+			fmt.Fprintf(os.Stderr, "OK\n")
 			success++
 		}
 	}
 
-	fmt.Printf("\nDone: %d uploaded, %d failed\n", success, fail)
+	fmt.Fprintf(os.Stderr, "\nDone: %d uploaded, %d failed\n", success, fail)
 	if fail > 0 {
 		os.Exit(1)
 	}
