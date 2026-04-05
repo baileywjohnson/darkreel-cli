@@ -60,7 +60,6 @@ darkreel-cli upload [flags] FILE [FILE...]
 Flags:
   -server    Darkreel server URL (e.g., https://media.example.com)
   -user      Username
-  -pass      Password
   -register  Register a new account before uploading (requires ALLOW_REGISTRATION=true on the server)
 ```
 
@@ -74,22 +73,22 @@ Credentials can be passed via environment variables instead of CLI flags. This i
 | `DRK_USER` | Username |
 | `DRK_PASS` | Password |
 
-CLI flags take precedence over environment variables.
+The password must be set via `DRK_PASS`. Server URL and username can also be set via `-server` and `-user` flags, which take precedence over their env var equivalents.
 
 ## Examples
 
 ```bash
-# Upload using CLI flags
-darkreel-cli upload -server https://media.example.com -user alice -pass secret photo.jpg video.mp4
-
 # Upload using environment variables (recommended)
 export DRK_SERVER=https://media.example.com
 export DRK_USER=alice
 export DRK_PASS=secret
 darkreel-cli upload photo.jpg video.mp4
 
+# Override server and user via flags
+DRK_PASS=secret darkreel-cli upload -server https://media.example.com -user alice photo.jpg video.mp4
+
 # Register a new account and upload
-darkreel-cli upload -server https://media.example.com -user newuser -pass mypassword -register vacation.mp4
+DRK_PASS=mypassword darkreel-cli upload -server https://media.example.com -user newuser -register vacation.mp4
 
 # Upload all images in a directory
 darkreel-cli upload ~/Photos/*.jpg
@@ -122,10 +121,8 @@ When a file is encrypted, a random 32-byte nonce is injected into the file's met
 | JPEG | Inserts a COM (comment) marker after SOI |
 | PNG | Inserts a tEXt chunk before IDAT |
 | MP4 | Appends a "free" box at end of file |
-| WebM | Appends marker bytes |
-| Other | Appends marker bytes |
 
-If hash modification fails for a given format, the file is uploaded unmodified.
+Unsupported formats (WebM, MKV, AVI, etc.) skip hash modification and are uploaded as-is.
 
 ## Supported formats
 
