@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/baileywjohnson/darkreel-cli/internal/crypto"
 	_ "golang.org/x/image/webp"
@@ -55,7 +56,12 @@ func printUsage() {
 	fmt.Println(`drk — Darkreel CLI
 
 Usage:
-  drk upload -server URL -user USERNAME -pass PASSWORD FILE [FILE...]
+  drk upload -server URL -user USERNAME FILE [FILE...]
+
+Environment variables:
+  DRK_PASS    Password (required; not accepted as a CLI flag for security)
+  DRK_SERVER  Server URL (fallback if -server not provided)
+  DRK_USER    Username (fallback if -user not provided)
 
 Commands:
   upload    Encrypt and upload files to a Darkreel server
@@ -63,17 +69,16 @@ Commands:
 Upload flags:
   -server   Server URL (e.g., http://localhost:8080)
   -user     Username
-  -pass     Password
   -register Register a new account before uploading`)
 }
 
 func cmdUpload() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: drk upload -server URL -user USERNAME -pass PASSWORD FILE [FILE...]")
+		fmt.Fprintln(os.Stderr, "Usage: drk upload -server URL -user USERNAME FILE [FILE...]")
 		os.Exit(1)
 	}
 
-	var serverURL, username, password string
+	var serverURL, username string
 	var register bool
 	var files []string
 
@@ -82,13 +87,16 @@ func cmdUpload() {
 		switch args[i] {
 		case "-server":
 			i++
+			if i >= len(args) {
+				fatal("-server requires a value")
+			}
 			serverURL = strings.TrimRight(args[i], "/")
 		case "-user":
 			i++
+			if i >= len(args) {
+				fatal("-user requires a value")
+			}
 			username = args[i]
-		case "-pass":
-			i++
-			password = args[i]
 		case "-register":
 			register = true
 		default:
@@ -96,19 +104,18 @@ func cmdUpload() {
 		}
 	}
 
-	// Fall back to environment variables for credentials (avoids exposure in ps aux)
+	// Fall back to environment variables
 	if serverURL == "" {
 		serverURL = strings.TrimRight(os.Getenv("DRK_SERVER"), "/")
 	}
 	if username == "" {
 		username = os.Getenv("DRK_USER")
 	}
-	if password == "" {
-		password = os.Getenv("DRK_PASS")
-	}
+	// Password must come from environment variable only (never a CLI flag)
+	password := os.Getenv("DRK_PASS")
 
 	if serverURL == "" || username == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "Error: -server, -user, and -pass are required")
+		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
 		os.Exit(1)
 	}
 	if len(files) == 0 {
@@ -125,18 +132,19 @@ func cmdUpload() {
 		fmt.Fprintln(os.Stderr, "         Use HTTPS for production deployments.")
 	}
 
-	client := &http.Client{}
+	authClient := &http.Client{Timeout: 30 * time.Second}
+	uploadClient := &http.Client{Timeout: 10 * time.Minute}
 
 	// Register if requested
 	if register {
 		fmt.Printf("Registering user %q...\n", username)
 		body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-		resp, err := client.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(body))
+		resp, err := authClient.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(body))
 		if err != nil {
 			fatal("register request failed: %v", err)
 		}
 		if resp.StatusCode != 201 {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			fatal("register failed (%d): %s", resp.StatusCode, string(b))
 		}
@@ -147,18 +155,20 @@ func cmdUpload() {
 	// Login
 	fmt.Printf("Logging in as %q...\n", username)
 	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	resp, err := client.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(body))
+	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		fatal("login request failed: %v", err)
 	}
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		fatal("login failed (%d): %s", resp.StatusCode, string(b))
 	}
 
 	var loginResp loginResponse
-	json.NewDecoder(resp.Body).Decode(&loginResp)
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		fatal("failed to parse login response: %v", err)
+	}
 	resp.Body.Close()
 
 	// Derive master key: decrypt the encrypted master key from server
@@ -173,7 +183,7 @@ func cmdUpload() {
 	success, fail := 0, 0
 	for _, f := range files {
 		fmt.Fprintf(os.Stderr, "  file %d/%d ", success+fail+1, len(files))
-		if err := uploadFile(client, serverURL, loginResp.Token, masterKey, f); err != nil {
+		if err := uploadFile(uploadClient, serverURL, loginResp.Token, masterKey, f); err != nil {
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
 		} else {
@@ -233,6 +243,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if err != nil {
 		// Non-fatal; continue with unmodified data
 		data, _ = os.ReadFile(filePath)
+		hashNonce = nil
 	}
 
 	// Generate thumbnail
@@ -307,9 +318,11 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		"chunk_count":    chunkCount,
 		"file_key_enc":   base64.StdEncoding.EncodeToString(encFileKey),
 		"thumb_key_enc":  base64.StdEncoding.EncodeToString(encThumbKey),
-		"hash_nonce":     base64.StdEncoding.EncodeToString(hashNonce),
 		"metadata_enc":   base64.StdEncoding.EncodeToString(metadataCiphertext),
 		"metadata_nonce": base64.StdEncoding.EncodeToString(metadataNonce),
+	}
+	if len(hashNonce) > 0 {
+		meta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
 	}
 
 	// Build multipart body
@@ -351,7 +364,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 201 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return fmt.Errorf("server error (%d): %s", resp.StatusCode, string(b))
 	}
 

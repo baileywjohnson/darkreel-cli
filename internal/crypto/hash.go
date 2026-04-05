@@ -31,9 +31,9 @@ func ModifyHash(data []byte, mimeType string, nonce []byte) ([]byte, error) {
 	case strings.Contains(lower, "mp4") || strings.Contains(lower, "quicktime"):
 		return modifyMP4(data, nonce)
 	case strings.Contains(lower, "webm") || strings.Contains(lower, "matroska"):
-		return modifyWebM(data, nonce)
+		return nil, fmt.Errorf("unsupported format for hash modification: %s", mimeType)
 	default:
-		return appendMarker(data, nonce), nil
+		return nil, fmt.Errorf("unsupported format for hash modification: %s", mimeType)
 	}
 }
 
@@ -132,14 +132,3 @@ func modifyMP4(data []byte, nonce []byte) ([]byte, error) {
 	return result, nil
 }
 
-func modifyWebM(data []byte, nonce []byte) ([]byte, error) {
-	return appendMarker(data, nonce), nil
-}
-
-func appendMarker(data []byte, nonce []byte) []byte {
-	marker := append([]byte("DARKREEL:"), nonce...)
-	result := make([]byte, len(data)+len(marker))
-	copy(result, data)
-	copy(result[len(data):], marker)
-	return result
-}
