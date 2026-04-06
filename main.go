@@ -219,11 +219,6 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		return fmt.Errorf("read: %w", err)
 	}
 
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return fmt.Errorf("stat: %w", err)
-	}
-
 	ext := strings.ToLower(filepath.Ext(filePath))
 	mimeType := mime.TypeByExtension(ext)
 	if mimeType == "" {
@@ -234,16 +229,38 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		mediaType = "video"
 	}
 
-	// Hash modification
-	hashNonce, err := crypto.GenerateHashNonce()
-	if err != nil {
-		return err
+	// For videos, attempt fMP4 remux and codec probing
+	fragmented := false
+	codecString := ""
+	var videoWidth, videoHeight int
+	var videoDuration float64
+
+	if mediaType == "video" {
+		fmp4Data, ok := remuxToFMP4(filePath)
+		if ok {
+			data = fmp4Data
+			fragmented = true
+			mimeType = "video/mp4"
+		}
+		codecString = probeCodecs(filePath)
+		videoWidth, videoHeight, videoDuration = probeVideoDimensions(filePath)
 	}
-	data, err = crypto.ModifyHash(data, mimeType, hashNonce)
-	if err != nil {
-		// Non-fatal; continue with unmodified data
-		data, _ = os.ReadFile(filePath)
+
+	// Hash modification — skip for fMP4 remuxed videos (would break container)
+	var hashNonce []byte
+	if fragmented {
 		hashNonce = nil
+	} else {
+		hashNonce, err = crypto.GenerateHashNonce()
+		if err != nil {
+			return err
+		}
+		data, err = crypto.ModifyHash(data, mimeType, hashNonce)
+		if err != nil {
+			// Non-fatal; continue with unmodified data
+			data, _ = os.ReadFile(filePath)
+			hashNonce = nil
+		}
 	}
 
 	// Generate thumbnail
@@ -295,13 +312,27 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	}
 
 	// Build and encrypt the metadata blob (name, type, mime, size, etc.)
-	metadataPlain, err := json.Marshal(map[string]any{
+	metaMap := map[string]any{
 		"name":        filepath.Base(filePath),
 		"media_type":  mediaType,
 		"mime_type":   mimeType,
-		"size":        info.Size(),
+		"size":        len(data),
 		"chunk_count": chunkCount,
-	})
+	}
+	if fragmented {
+		metaMap["fragmented"] = true
+	}
+	if codecString != "" {
+		metaMap["codecs"] = codecString
+	}
+	if videoWidth > 0 && videoHeight > 0 {
+		metaMap["width"] = videoWidth
+		metaMap["height"] = videoHeight
+	}
+	if videoDuration > 0 {
+		metaMap["duration"] = videoDuration
+	}
+	metadataPlain, err := json.Marshal(metaMap)
 	if err != nil {
 		return err
 	}
@@ -369,6 +400,177 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	}
 
 	return nil
+}
+
+// remuxToFMP4 remuxes the video at filePath to fragmented MP4 using ffmpeg.
+// Returns the fMP4 data and true on success, or nil and false if ffmpeg is
+// unavailable or the remux fails.
+func remuxToFMP4(filePath string) ([]byte, bool) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n    (ffmpeg not found — skipping fMP4 remux)\n    ")
+		return nil, false
+	}
+
+	tmpFile, err := os.CreateTemp("", "drk-fmp4-*.mp4")
+	if err != nil {
+		return nil, false
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	cmd := exec.Command(ffmpeg,
+		"-y",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4",
+		tmpPath,
+	)
+	cmd.Stderr = nil
+	cmd.Stdout = nil
+
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "\n    (fMP4 remux failed — using original file)\n    ")
+		return nil, false
+	}
+
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// probeCodecs uses ffprobe to determine video and audio codecs, returning a
+// codec string suitable for MSE (e.g. "avc1.64001f,mp4a.40.2"). Returns a
+// reasonable default if ffprobe is unavailable.
+func probeCodecs(filePath string) string {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return "avc1.64001f,mp4a.40.2"
+	}
+
+	// Probe video codec
+	videoCodec := probeStreamCodec(ffprobe, filePath, "v:0")
+	audioCodec := probeStreamCodec(ffprobe, filePath, "a:0")
+
+	videoMSE := mapVideoCodec(videoCodec)
+	audioMSE := mapAudioCodec(audioCodec)
+
+	if videoMSE != "" && audioMSE != "" {
+		return videoMSE + "," + audioMSE
+	}
+	if videoMSE != "" {
+		return videoMSE
+	}
+	return "avc1.64001f,mp4a.40.2"
+}
+
+func probeStreamCodec(ffprobe, filePath, stream string) string {
+	type ffprobeResult struct {
+		Streams []struct {
+			CodecName string `json:"codec_name"`
+		} `json:"streams"`
+	}
+
+	cmd := exec.Command(ffprobe,
+		"-v", "quiet",
+		"-select_streams", stream,
+		"-show_entries", "stream=codec_name",
+		"-of", "json",
+		filePath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var result ffprobeResult
+	if err := json.Unmarshal(out, &result); err != nil || len(result.Streams) == 0 {
+		return ""
+	}
+	return result.Streams[0].CodecName
+}
+
+func mapVideoCodec(codec string) string {
+	switch codec {
+	case "h264":
+		return "avc1.64001f"
+	case "hevc", "h265":
+		return "hev1.1.6.L93.B0"
+	case "vp9":
+		return "vp09.00.10.08"
+	case "av1":
+		return "av01.0.01M.08"
+	default:
+		return "avc1.64001f"
+	}
+}
+
+func mapAudioCodec(codec string) string {
+	switch codec {
+	case "aac":
+		return "mp4a.40.2"
+	case "opus":
+		return "opus"
+	case "mp3":
+		return "mp4a.40.34"
+	default:
+		if codec != "" {
+			return "mp4a.40.2"
+		}
+		return ""
+	}
+}
+
+// probeVideoDimensions uses ffprobe to get video width, height, and duration.
+func probeVideoDimensions(filePath string) (int, int, float64) {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	type ffprobeResult struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+
+	cmd := exec.Command(ffprobe,
+		"-v", "quiet",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height:format=duration",
+		"-of", "json",
+		filePath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	var result ffprobeResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		return 0, 0, 0
+	}
+
+	var w, h int
+	if len(result.Streams) > 0 {
+		w = result.Streams[0].Width
+		h = result.Streams[0].Height
+	}
+
+	var dur float64
+	if result.Format.Duration != "" {
+		fmt.Sscanf(result.Format.Duration, "%f", &dur)
+	}
+
+	return w, h, dur
 }
 
 func generateThumbnail(data []byte, mimeType, filePath string) []byte {

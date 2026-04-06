@@ -100,17 +100,20 @@ darkreel-cli upload ~/Photos/*.jpg
 2. Receives the master key encrypted with a PBKDF2-derived session key, decrypts it client-side
 3. For each file:
    - Reads the file
-   - Injects random metadata to modify the file hash (without affecting playback)
+   - **Videos:** Remuxes to fragmented MP4 via ffmpeg (`-c copy`, no re-encoding) for streaming playback, probes codecs via ffprobe
+   - **Images:** Injects random metadata to modify the file hash (without affecting display)
    - Generates a 320px JPEG thumbnail
    - Generates random 256-bit encryption keys for file and thumbnail
-   - Encrypts metadata (name, type, MIME, size, chunk count) into a single blob with the master key
+   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key
    - Splits the file into 1 MB chunks
    - Encrypts each chunk with AES-256-GCM (chunk index as AAD)
    - Encrypts the thumbnail
    - Encrypts the file/thumbnail keys with your master key
    - Uploads everything via multipart POST
 
-The server only ever receives encrypted data and an encrypted metadata blob. File names, types, sizes, and dimensions are never visible to the server.
+The server only ever receives encrypted data and an encrypted metadata blob. File names, types, sizes, dimensions, and codecs are never visible to the server.
+
+Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadata, enabling instant streaming playback in the Darkreel web UI via MediaSource Extensions.
 
 ## Hash modification
 
