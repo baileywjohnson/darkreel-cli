@@ -105,7 +105,7 @@ darkreel-cli upload ~/Photos/*.jpg
    - Generates a 320px JPEG thumbnail
    - Generates random 256-bit encryption keys for file and thumbnail
    - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key
-   - Splits the file into 1 MB chunks
+   - Splits the file into chunks — videos at fMP4 segment boundaries (one moof+mdat per chunk), other files at 1 MB
    - Encrypts each chunk with AES-256-GCM (chunk index as AAD)
    - Encrypts the thumbnail
    - Encrypts the file/thumbnail keys with your master key

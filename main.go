@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -25,7 +26,7 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-const chunkSize = 1 << 20 // 1 MB — must match server
+const chunkSize = 1 << 20 // 1 MB — used for non-fragmented files only
 
 type loginResponse struct {
 	Token              string `json:"token"`
@@ -285,16 +286,25 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 
-	// Encrypt file in chunks
-	chunkCount := (len(data) + chunkSize - 1) / chunkSize
-	encChunks := make([][]byte, chunkCount)
-	for i := 0; i < chunkCount; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > len(data) {
-			end = len(data)
+	// Split into segments: fMP4 at moof boundaries, otherwise fixed 1 MB chunks
+	var segments [][]byte
+	if fragmented {
+		segments = splitFMP4Segments(data)
+	} else {
+		for start := 0; start < len(data); start += chunkSize {
+			end := start + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			segments = append(segments, data[start:end])
 		}
-		enc, err := crypto.EncryptChunk(data[start:end], fileKey, i)
+	}
+	chunkCount := len(segments)
+
+	// Encrypt segments
+	encChunks := make([][]byte, chunkCount)
+	for i, seg := range segments {
+		enc, err := crypto.EncryptChunk(seg, fileKey, i)
 		if err != nil {
 			return fmt.Errorf("encrypt chunk %d: %w", i, err)
 		}
@@ -664,6 +674,75 @@ func placeholderThumb() []byte {
 	var buf bytes.Buffer
 	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 50})
 	return buf.Bytes()
+}
+
+// readBoxHeader reads an MP4 box header at the given position.
+// Returns the box size and 4-character type string.
+func readBoxHeader(data []byte, pos int) (size int, boxType string) {
+	if pos+8 > len(data) {
+		return 0, ""
+	}
+	size = int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	boxType = string(data[pos+4 : pos+8])
+	if size == 1 && pos+16 <= len(data) {
+		// 64-bit extended size
+		size = int(binary.BigEndian.Uint64(data[pos+8 : pos+16]))
+	}
+	if size == 0 {
+		size = len(data) - pos
+	}
+	return
+}
+
+// splitFMP4Segments splits fMP4 data at moof boundaries.
+// Returns [init_segment, segment_1, segment_2, ...] where the init segment
+// is everything before the first moof, and each media segment is a moof+mdat pair.
+func splitFMP4Segments(data []byte) [][]byte {
+	var segments [][]byte
+	pos := 0
+	initEnd := 0
+
+	for pos < len(data) {
+		size, boxType := readBoxHeader(data, pos)
+		if size == 0 || boxType == "" {
+			break
+		}
+		if pos+size > len(data) {
+			break
+		}
+
+		if boxType == "moof" {
+			if initEnd == 0 {
+				initEnd = pos
+			}
+			// moof + following mdat = one segment
+			moofEnd := pos + size
+			segEnd := moofEnd
+			// Check if next box is mdat
+			if moofEnd < len(data) {
+				nextSize, nextType := readBoxHeader(data, moofEnd)
+				if nextType == "mdat" && nextSize > 0 && moofEnd+nextSize <= len(data) {
+					segEnd = moofEnd + nextSize
+				}
+			}
+			segments = append(segments, data[pos:segEnd])
+			pos = segEnd
+			continue
+		}
+
+		pos += size
+	}
+
+	// Init segment is everything before first moof
+	if initEnd > 0 {
+		result := make([][]byte, 0, len(segments)+1)
+		result = append(result, data[:initEnd])
+		result = append(result, segments...)
+		return result
+	}
+
+	// No moof found — return as single chunk
+	return [][]byte{data}
 }
 
 func isVideo(ext string) bool {
