@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/baileywjohnson/darkreel-cli/internal/crypto"
+	"github.com/google/uuid"
 	_ "golang.org/x/image/webp"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -173,7 +174,7 @@ func cmdUpload() {
 	resp.Body.Close()
 
 	// Derive master key: decrypt the encrypted master key from server
-	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password, loginResp.KDFSalt)
+	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password, loginResp.KDFSalt, loginResp.UserID)
 	if err != nil {
 		fatal("failed to decrypt master key: %v", err)
 	}
@@ -199,7 +200,7 @@ func cmdUpload() {
 	}
 }
 
-func decryptMasterKey(encB64, password, kdfSaltB64 string) ([]byte, error) {
+func decryptMasterKey(encB64, password, kdfSaltB64, userID string) ([]byte, error) {
 	encData, err := base64.StdEncoding.DecodeString(encB64)
 	if err != nil {
 		return nil, err
@@ -211,7 +212,7 @@ func decryptMasterKey(encB64, password, kdfSaltB64 string) ([]byte, error) {
 	sessionKey := pbkdf2.Key([]byte(password), kdfSalt, 600000, 32, sha256.New)
 	defer zeroBytes(sessionKey)
 
-	return crypto.DecryptBlock(encData, sessionKey)
+	return crypto.DecryptBlock(encData, sessionKey, []byte(userID))
 }
 
 func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, filePath string) error {
@@ -280,8 +281,12 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	}
 	defer zeroBytes(thumbKey)
 
+	// Generate media ID first — needed as AAD for chunk and key encryption
+	mediaID := uuid.New().String()
+	mediaIDBytes := []byte(mediaID)
+
 	// Encrypt thumbnail
-	encThumb, err := crypto.EncryptChunk(thumbData, thumbKey, 0)
+	encThumb, err := crypto.EncryptChunk(thumbData, thumbKey, 0, mediaID)
 	if err != nil {
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
@@ -304,19 +309,19 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	// Encrypt segments
 	encChunks := make([][]byte, chunkCount)
 	for i, seg := range segments {
-		enc, err := crypto.EncryptChunk(seg, fileKey, i)
+		enc, err := crypto.EncryptChunk(seg, fileKey, i, mediaID)
 		if err != nil {
 			return fmt.Errorf("encrypt chunk %d: %w", i, err)
 		}
 		encChunks[i] = enc
 	}
 
-	// Encrypt keys with master key
-	encFileKey, err := crypto.EncryptKey(fileKey, masterKey)
+	// Encrypt keys with master key, bound to this media item via AAD
+	encFileKey, err := crypto.EncryptKey(fileKey, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
 	}
-	encThumbKey, err := crypto.EncryptKey(thumbKey, masterKey)
+	encThumbKey, err := crypto.EncryptKey(thumbKey, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
 	}
@@ -346,7 +351,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if err != nil {
 		return err
 	}
-	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey)
+	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
 	}
@@ -356,6 +361,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 
 	// Build upload metadata
 	meta := map[string]any{
+		"media_id":       mediaID,
 		"chunk_count":    chunkCount,
 		"file_key_enc":   base64.StdEncoding.EncodeToString(encFileKey),
 		"thumb_key_enc":  base64.StdEncoding.EncodeToString(encThumbKey),

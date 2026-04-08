@@ -7,7 +7,8 @@ import (
 )
 
 // DecryptBlock decrypts a small block (e.g., a file key) encrypted with EncryptBlock.
-func DecryptBlock(ciphertext, key []byte) ([]byte, error) {
+// The aad parameter must match the value used during encryption.
+func DecryptBlock(ciphertext, key, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -21,5 +22,5 @@ func DecryptBlock(ciphertext, key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
 	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ct, nil)
+	return gcm.Open(nil, nonce, ct, aad)
 }

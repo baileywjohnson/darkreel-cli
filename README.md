@@ -106,9 +106,9 @@ darkreel-cli upload ~/Photos/*.jpg
    - Generates random 256-bit encryption keys for file and thumbnail
    - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key
    - Splits the file into chunks — videos at fMP4 segment boundaries (one moof+mdat per chunk), other files at 1 MB
-   - Encrypts each chunk with AES-256-GCM (chunk index as AAD)
+   - Encrypts each chunk with AES-256-GCM (media ID + chunk index as AAD)
    - Encrypts the thumbnail
-   - Encrypts the file/thumbnail keys with your master key
+   - Encrypts the file/thumbnail keys with your master key (media ID as AAD)
    - Uploads everything via multipart POST
 
 The server only ever receives encrypted data and an encrypted metadata blob. File names, types, sizes, dimensions, and codecs are never visible to the server.

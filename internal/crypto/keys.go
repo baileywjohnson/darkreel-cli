@@ -15,6 +15,8 @@ func GenerateFileKey() ([]byte, error) {
 }
 
 // EncryptKey encrypts a file key with the user's master key using AES-256-GCM.
-func EncryptKey(fileKey, masterKey []byte) ([]byte, error) {
-	return EncryptBlock(fileKey, masterKey)
+// The mediaID binds the encrypted key to a specific media item, preventing
+// ciphertext substitution between items.
+func EncryptKey(fileKey, masterKey, mediaID []byte) ([]byte, error) {
+	return EncryptBlock(fileKey, masterKey, mediaID)
 }
