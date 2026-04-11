@@ -186,6 +186,8 @@ func cmdUpload() {
 	for _, f := range files {
 		fmt.Fprintf(os.Stderr, "  file %d/%d ", success+fail+1, len(files))
 		if err := uploadFile(uploadClient, serverURL, loginResp.Token, masterKey, f); err != nil {
+			// Error details intentionally omitted — server responses may contain
+			// information useful for fingerprinting or probing the API.
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
 		} else {
