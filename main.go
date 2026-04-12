@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -27,7 +28,8 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-const chunkSize = 1 << 20 // 1 MB — used for non-fragmented files only
+const chunkSize = 1 << 20       // 1 MB — used for non-fragmented files only
+const subprocessTimeout = 10 * time.Minute // ffmpeg/ffprobe timeout
 
 // segment describes a byte range in a source file.
 type segment struct {
@@ -154,8 +156,11 @@ func cmdUpload() {
 		fmt.Fprintln(os.Stderr, "         Use HTTPS for production deployments.")
 	}
 
-	authClient := &http.Client{Timeout: 30 * time.Second}
-	uploadClient := &http.Client{Timeout: 10 * time.Minute}
+	noRedirect := func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	authClient := &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirect}
+	uploadClient := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: noRedirect}
 
 	// Register if requested
 	if register {
@@ -190,7 +195,7 @@ func cmdUpload() {
 	}
 
 	var loginResp loginResponse
-	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&loginResp); err != nil {
 		fatal("failed to parse login response: %v", err)
 	}
 	resp.Body.Close()
@@ -501,7 +506,9 @@ func remuxToFMP4File(filePath string) (string, bool) {
 	tmpPath := tmpFile.Name()
 	tmpFile.Close()
 
-	cmd := exec.Command(ffmpeg,
+	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpeg,
 		"-y",
 		"-i", filePath,
 		"-c", "copy",
@@ -620,7 +627,9 @@ func probeStreamCodec(ffprobe, filePath, stream string) string {
 		} `json:"streams"`
 	}
 
-	cmd := exec.Command(ffprobe,
+	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobe,
 		"-v", "quiet",
 		"-select_streams", stream,
 		"-show_entries", "stream=codec_name",
@@ -687,7 +696,9 @@ func probeVideoDimensions(filePath string) (int, int, float64) {
 		} `json:"format"`
 	}
 
-	cmd := exec.Command(ffprobe,
+	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobe,
 		"-v", "quiet",
 		"-select_streams", "v:0",
 		"-show_entries", "stream=width,height:format=duration",
@@ -785,7 +796,9 @@ func generateVideoThumbnail(filePath string) []byte {
 	tmpFile.Close()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command(ffmpeg,
+	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpeg,
 		"-i", filePath,
 		"-ss", "00:00:01",
 		"-vframes", "1",
@@ -1002,7 +1015,7 @@ func parseConnFlags(args []string) (connFlags, []string) {
 // login authenticates and returns (token, masterKey). Caller must zeroBytes(masterKey).
 // Zeroes the password in cf after use.
 func login(cf connFlags) (string, []byte) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	// Build JSON manually to avoid string copies from json.Marshal
 	jsonBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, cf.username, string(cf.password))
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
@@ -1016,7 +1029,7 @@ func login(cf connFlags) (string, []byte) {
 		fatal("login failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 	}
 	var lr loginResponse
-	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&lr); err != nil {
 		fatal("failed to parse login response: %v", err)
 	}
 	resp.Body.Close()
@@ -1093,7 +1106,7 @@ func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error
 }
 
 func fetchAllMedia(serverURL, token string) ([]apiMediaItem, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var all []apiMediaItem
 	page := 1
 	const maxPages = 1000
@@ -1107,13 +1120,13 @@ func fetchAllMedia(serverURL, token string) ([]apiMediaItem, error) {
 		if resp.StatusCode != 200 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(b))
+			return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 		}
 		var result struct {
 			Items []apiMediaItem `json:"items"`
 			Total int            `json:"total"`
 		}
-		json.NewDecoder(resp.Body).Decode(&result)
+		json.NewDecoder(io.LimitReader(resp.Body, 5<<20)).Decode(&result)
 		resp.Body.Close()
 		all = append(all, result.Items...)
 		if len(all) >= result.Total || len(result.Items) == 0 {
@@ -1219,7 +1232,7 @@ func cmdDownload() {
 		return
 	}
 
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	success, fail := 0, 0
 
 	for i, item := range toDownload {
