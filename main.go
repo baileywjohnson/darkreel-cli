@@ -165,7 +165,7 @@ func cmdUpload() {
 	// Register if requested
 	if register {
 		fmt.Printf("Registering user %q...\n", username)
-		regBody, _ := json.Marshal(map[string]string{"username": username, "password": string(password)})
+		regBody := buildAuthJSON(username, password)
 		resp, err := authClient.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(regBody))
 		zeroBytes(regBody)
 		if err != nil {
@@ -182,7 +182,7 @@ func cmdUpload() {
 
 	// Login
 	fmt.Printf("Logging in as %q...\n", username)
-	loginBody, _ := json.Marshal(map[string]string{"username": username, "password": string(password)})
+	loginBody := buildAuthJSON(username, password)
 	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(loginBody))
 	zeroBytes(loginBody)
 	if err != nil {
@@ -959,6 +959,44 @@ func zeroBytes(b []byte) {
 	}
 }
 
+// buildAuthJSON constructs a JSON body like {"username":"...","password":"..."}
+// without converting the password to a Go string (which would be immutable and
+// impossible to zero from memory). The returned []byte should be zeroed after use.
+func buildAuthJSON(username string, password []byte) []byte {
+	// JSON-escape the password bytes in case they contain characters that need escaping.
+	var escaped []byte
+	for _, b := range password {
+		switch b {
+		case '"':
+			escaped = append(escaped, '\\', '"')
+		case '\\':
+			escaped = append(escaped, '\\', '\\')
+		case '\n':
+			escaped = append(escaped, '\\', 'n')
+		case '\r':
+			escaped = append(escaped, '\\', 'r')
+		case '\t':
+			escaped = append(escaped, '\\', 't')
+		default:
+			if b < 0x20 {
+				escaped = append(escaped, []byte(fmt.Sprintf("\\u%04x", b))...)
+			} else {
+				escaped = append(escaped, b)
+			}
+		}
+	}
+	// JSON-escape the username too (it's already a string, but be safe).
+	usernameJSON, _ := json.Marshal(username)
+	buf := make([]byte, 0, len(`{"username":,"password":""}`)+len(usernameJSON)+len(escaped))
+	buf = append(buf, `{"username":`...)
+	buf = append(buf, usernameJSON...)
+	buf = append(buf, `,"password":"`...)
+	buf = append(buf, escaped...)
+	buf = append(buf, `"}`...)
+	zeroBytes(escaped)
+	return buf
+}
+
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
 	os.Exit(1)
@@ -1050,7 +1088,7 @@ func validateServerURL(serverURL string) {
 // Zeroes the password in cf after use.
 func login(cf connFlags) (string, []byte) {
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	jsonBody, _ := json.Marshal(map[string]string{"username": cf.username, "password": string(cf.password)})
+	jsonBody := buildAuthJSON(cf.username, cf.password)
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
 	zeroBytes(jsonBody)
 	if err != nil {
