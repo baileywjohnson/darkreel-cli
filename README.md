@@ -155,7 +155,7 @@ Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadat
 
 1. Authenticates and fetches the media list
 2. Decrypts metadata blobs to get filenames, chunk counts, and file keys
-3. For each item, fetches chunks in parallel (4 workers) via the padded chunk endpoint
+3. For each item, fetches chunks in parallel (4 workers, connection-pooled) via the padded chunk endpoint
 4. Each chunk: strips server-side padding → decrypts with AES-256-GCM → writes to disk in order
 5. Downloaded filenames are sanitized (`filepath.Base`) to prevent path traversal
 
@@ -200,7 +200,7 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 
 - **Password never on CLI** — accepted only via `DRK_PASS` environment variable (invisible to `ps aux` / `/proc/pid/cmdline`)
 - **Password cleared from environment** — `os.Unsetenv("DRK_PASS")` called immediately after reading, invisible to child processes and `/proc/pid/environ`
-- **Password zeroed in memory** — stored as `[]byte` (not Go `string`) and zeroed after master key derivation
+- **Password zeroed in memory** — stored as `[]byte` (not Go `string`) and zeroed after master key derivation. Auth JSON bodies are constructed directly from `[]byte` without converting the password to an immutable Go `string`, preventing un-zeroable copies from lingering on the heap
 - **File keys zeroed** — all per-file encryption keys are zeroed after use via `defer`
 - **Server responses sanitized** — error bodies stripped of non-printable characters (ANSI escapes, control codes) before display, truncated to 512 chars
 - **Path traversal protection** — downloaded filenames sanitized via `filepath.Base()` to prevent writes outside the output directory
@@ -215,6 +215,8 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **Subprocess timeouts** — all ffmpeg and ffprobe invocations have a 10-minute timeout via `exec.CommandContext`, preventing indefinite hangs on malformed or adversarially crafted files
 - **HTTP status validation** — all API responses checked for expected status codes before processing
 - **Temp file cleanup** — all temporary files (fMP4 remux, hash modification) cleaned up via `defer`, even on error paths
+- **PNG parsing bounds check** — hash modification for PNG files guards against chunks extending beyond the 64 KB header buffer, preventing panics on crafted PNGs with large pre-IDAT ancillary data
+- **Connection pool tuning** — download HTTP client's `MaxIdleConnsPerHost` matches the worker count (4), ensuring all parallel chunk fetches reuse connections instead of creating new ones
 
 ## Related projects
 
