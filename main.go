@@ -849,6 +849,7 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 	// This reuses the same logic as the in-memory functions but only on the header.
 	var insertPos int
 	var blob []byte
+	var endBlob []byte // appended after file content (MP4 free box)
 
 	switch {
 	case (strings.Contains(lower, "jpeg") || strings.Contains(lower, "jpg")) && header[0] == 0xFF && header[1] == 0xD8:
@@ -865,17 +866,17 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 		// PNG: insert tEXt chunk before first IDAT
 		pos := 8
 		for pos+8 <= n {
-			chunkLen := int(binary.BigEndian.Uint32(header[pos : pos+4]))
+			chunkLen := binary.BigEndian.Uint32(header[pos : pos+4])
 			chunkType := string(header[pos+4 : pos+8])
 			if chunkType == "IDAT" {
 				break
 			}
-			next := pos + 12 + chunkLen
-			if next > n {
+			next := int64(pos) + 12 + int64(chunkLen)
+			if next > int64(n) {
 				// Chunk extends beyond header buffer; insert at current position
 				break
 			}
-			pos = next
+			pos = int(next)
 		}
 		insertPos = pos
 		keyword := "darkreel"
@@ -884,19 +885,14 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 		blob = crypto.BuildPNGChunkExported("tEXt", textData)
 
 	case (strings.Contains(lower, "mp4") || strings.Contains(lower, "quicktime")) && n >= 8:
-		// MP4: insert 'free' box after ftyp
-		insertPos = 0
-		if string(header[4:8]) == "ftyp" {
-			boxSize := int(binary.BigEndian.Uint32(header[0:4]))
-			if boxSize <= n {
-				insertPos = boxSize
-			}
-		}
+		// MP4: append 'free' box at the END of the file.
+		// Inserting before moov would corrupt stco/co64 byte offsets.
+		insertPos = n // write full header as prefix; blob appended after streaming
 		boxSize := uint32(8 + len(nonce))
-		blob = make([]byte, boxSize)
-		binary.BigEndian.PutUint32(blob[0:4], boxSize)
-		copy(blob[4:8], "free")
-		copy(blob[8:], nonce)
+		endBlob = make([]byte, boxSize)
+		binary.BigEndian.PutUint32(endBlob[0:4], boxSize)
+		copy(endBlob[4:8], "free")
+		copy(endBlob[8:], nonce)
 
 	default:
 		return "", nil, fmt.Errorf("unsupported format: %s", mimeType)
@@ -932,6 +928,14 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 		tmp.Close()
 		os.Remove(tmpPath)
 		return "", nil, err
+	}
+	// Append blob at end of file (e.g. MP4 free box)
+	if endBlob != nil {
+		if _, err := tmp.Write(endBlob); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return "", nil, err
+		}
 	}
 	tmp.Close()
 	return tmpPath, nonce, nil
@@ -1197,9 +1201,15 @@ func fetchAllMedia(serverURL, token string) ([]apiMediaItem, error) {
 			Items []apiMediaItem `json:"items"`
 			Total int            `json:"total"`
 		}
-		json.NewDecoder(io.LimitReader(resp.Body, 5<<20)).Decode(&result)
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 5<<20)).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("invalid response on page %d: %w", page, err)
+		}
 		resp.Body.Close()
 		all = append(all, result.Items...)
+		if len(all) > 50000 {
+			break
+		}
 		if len(all) >= result.Total || len(result.Items) == 0 {
 			break
 		}
@@ -1280,6 +1290,9 @@ func cmdDownload() {
 	// Build a map for lookup
 	itemMap := make(map[string]apiMediaItem, len(items))
 	for _, item := range items {
+		if _, err := uuid.Parse(item.ID); err != nil {
+			continue
+		}
 		itemMap[item.ID] = item
 	}
 
@@ -1318,7 +1331,8 @@ func cmdDownload() {
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "  [%d/%d] %s ", i+1, len(toDownload), meta.Name)
+		displayName := sanitizeServerResponse([]byte(meta.Name))
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s ", i+1, len(toDownload), displayName)
 
 		// Decrypt file key
 		fileKeyEnc, err := base64.StdEncoding.DecodeString(item.FileKeyEnc)
@@ -1362,6 +1376,15 @@ func cmdDownload() {
 		gcm, gcmErr := crypto.NewChunkCipher(fileKey)
 		if gcmErr != nil {
 			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+			zeroBytes(fileKey)
+			outFile.Close()
+			os.Remove(outPath)
+			continue
+		}
+
+		if meta.ChunkCount <= 0 || meta.ChunkCount > 50000 {
+			fmt.Fprintf(os.Stderr, "FAILED (invalid chunk count %d)\n", meta.ChunkCount)
 			fail++
 			zeroBytes(fileKey)
 			outFile.Close()
@@ -1418,7 +1441,7 @@ func cmdDownload() {
 					results[ci] <- res
 					return
 				}
-				io.Copy(io.Discard, resp.Body) // drain padding
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 20<<20)) // drain padding
 				resp.Body.Close()
 				plaintext, err := crypto.DecryptChunkWith(gcm, encrypted, ci, item.ID)
 				if err != nil {

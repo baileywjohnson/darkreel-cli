@@ -69,7 +69,11 @@ func modifyPNG(data []byte, nonce []byte) ([]byte, error) {
 		if chunkType == "IDAT" {
 			break
 		}
-		pos += 12 + int(chunkLen)
+		next := int64(pos) + 12 + int64(chunkLen)
+		if next > int64(len(data)) {
+			break
+		}
+		pos = int(next)
 	}
 
 	keyword := "darkreel"

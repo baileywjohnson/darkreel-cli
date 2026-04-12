@@ -171,7 +171,7 @@ When a file is encrypted, a random 32-byte nonce is injected into the file's met
 |--------|--------|
 | JPEG | Inserts a COM (comment) marker after SOI |
 | PNG | Inserts a tEXt chunk before IDAT |
-| MP4 | Inserts a "free" box after ftyp |
+| MP4 | Appends a "free" box at the end of the file |
 
 Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification and are uploaded as-is. Hash modification is also skipped for fMP4-remuxed videos since it would break the container structure.
 
@@ -207,7 +207,7 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **Restrictive file permissions** — downloaded files created with `0600` (owner read/write only)
 - **No shell execution** — all subprocesses (ffmpeg, ffprobe) spawned via `exec.Command` with argument arrays, never through a shell
 - **Absolute paths for subprocesses** — file paths resolved to absolute before passing to ffmpeg/ffprobe, preventing `-` prefix filenames from being interpreted as flags
-- **Chunk download limits** — response bodies capped at 20 MB per chunk to prevent memory exhaustion from a malicious server
+- **Chunk download limits** — response bodies capped at 20 MB per chunk, and server-side padding drained with a 20 MB cap, to prevent memory exhaustion from a malicious server
 - **Response body limits** — login responses capped at 1 MB, media list responses at 5 MB, preventing memory exhaustion from a malicious server on success paths
 - **HTTPS enforced by default** — plaintext HTTP is blocked for non-localhost URLs unless `-insecure` is explicitly passed. Localhost (`127.0.0.1`, `::1`, `localhost`) is exempt. Prevents accidental credential transmission in the clear
 - **URL scheme validation** — server URLs are validated to use only `http://` or `https://` schemes, rejecting `file://`, `ftp://`, and other exotic schemes that could be used to exfiltrate credentials
@@ -215,7 +215,11 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **Subprocess timeouts** — all ffmpeg and ffprobe invocations have a 10-minute timeout via `exec.CommandContext`, preventing indefinite hangs on malformed or adversarially crafted files
 - **HTTP status validation** — all API responses checked for expected status codes before processing
 - **Temp file cleanup** — all temporary files (fMP4 remux, hash modification) cleaned up via `defer`, even on error paths
-- **PNG parsing bounds check** — hash modification for PNG files guards against chunks extending beyond the 64 KB header buffer, preventing panics on crafted PNGs with large pre-IDAT ancillary data
+- **PNG parsing overflow protection** — hash modification for PNG files uses 64-bit arithmetic for chunk length calculations, preventing integer overflow on 32-bit systems and guarding against chunks extending beyond the 64 KB header buffer
+- **Chunk count validation** — downloaded media with invalid chunk counts (outside 1–50,000, matching the server limit) is rejected before allocating memory or spawning workers
+- **Media list pagination bounded** — the total number of items fetched from the server is capped at 50,000, preventing memory exhaustion from a malicious server returning unbounded pagination
+- **Server-provided IDs validated** — media item IDs from the server are validated as UUIDs before use in URL construction and decryption AAD
+- **Filename display sanitization** — filenames from decrypted metadata are stripped of control characters and ANSI escape sequences before terminal output, preventing terminal injection
 - **Connection pool tuning** — download HTTP client's `MaxIdleConnsPerHost` matches the worker count (4), ensuring all parallel chunk fetches reuse connections instead of creating new ones
 
 ## Related projects
