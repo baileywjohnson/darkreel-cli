@@ -870,7 +870,12 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 			if chunkType == "IDAT" {
 				break
 			}
-			pos += 12 + chunkLen
+			next := pos + 12 + chunkLen
+			if next > n {
+				// Chunk extends beyond header buffer; insert at current position
+				break
+			}
+			pos = next
 		}
 		insertPos = pos
 		keyword := "darkreel"
@@ -1260,7 +1265,11 @@ func cmdDownload() {
 		return
 	}
 
-	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{
+		Timeout:       10 * time.Minute,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Transport:     &http.Transport{MaxIdleConnsPerHost: 4}, // match dlWorkers to reuse connections
+	}
 	success, fail := 0, 0
 
 	for i, item := range toDownload {
