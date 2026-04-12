@@ -16,14 +16,17 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baileywjohnson/darkreel-cli/internal/crypto"
 	"github.com/google/uuid"
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -85,8 +88,9 @@ Commands:
   download  Download and decrypt media items by ID (or all if no IDs given)
 
 Common flags:
-  -server   Server URL (e.g., http://localhost:8080)
+  -server   Server URL (e.g., https://media.example.com)
   -user     Username
+  -insecure Allow plaintext HTTP for non-localhost URLs
 
 Upload flags:
   -register Register a new account before uploading
@@ -102,7 +106,7 @@ func cmdUpload() {
 	}
 
 	var serverURL, username string
-	var register bool
+	var register, insecure bool
 	var files []string
 
 	args := os.Args[2:]
@@ -122,6 +126,8 @@ func cmdUpload() {
 			username = args[i]
 		case "-register":
 			register = true
+		case "-insecure":
+			insecure = true
 		default:
 			files = append(files, args[i])
 		}
@@ -142,19 +148,13 @@ func cmdUpload() {
 		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
 		os.Exit(1)
 	}
+	validateServerURL(serverURL)
 	if len(files) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: no files specified")
 		os.Exit(1)
 	}
 
-	// Warn when using plaintext HTTP for non-localhost URLs
-	if strings.HasPrefix(serverURL, "http://") &&
-		!strings.HasPrefix(serverURL, "http://localhost") &&
-		!strings.HasPrefix(serverURL, "http://127.0.0.1") &&
-		!strings.HasPrefix(serverURL, "http://[::1]") {
-		fmt.Fprintln(os.Stderr, "WARNING: Using plaintext HTTP. Credentials and encryption keys will be sent unencrypted.")
-		fmt.Fprintln(os.Stderr, "         Use HTTPS for production deployments.")
-	}
+	requireHTTPS(serverURL, insecure)
 
 	noRedirect := func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -165,7 +165,7 @@ func cmdUpload() {
 	// Register if requested
 	if register {
 		fmt.Printf("Registering user %q...\n", username)
-		regBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, username, string(password))
+		regBody, _ := json.Marshal(map[string]string{"username": username, "password": string(password)})
 		resp, err := authClient.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(regBody))
 		zeroBytes(regBody)
 		if err != nil {
@@ -182,7 +182,7 @@ func cmdUpload() {
 
 	// Login
 	fmt.Printf("Logging in as %q...\n", username)
-	loginBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, username, string(password))
+	loginBody, _ := json.Marshal(map[string]string{"username": username, "password": string(password)})
 	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(loginBody))
 	zeroBytes(loginBody)
 	if err != nil {
@@ -280,6 +280,17 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	var videoWidth, videoHeight int
 	var videoDuration float64
 
+	// Start thumbnail generation concurrently (reads original file, not remuxed)
+	var thumbData []byte
+	var thumbWg sync.WaitGroup
+	if mediaType == "video" {
+		thumbWg.Add(1)
+		go func() {
+			defer thumbWg.Done()
+			thumbData = generateThumbnail(filePath)
+		}()
+	}
+
 	if mediaType == "video" {
 		fmp4Path, ok := remuxToFMP4File(filePath)
 		if ok {
@@ -288,8 +299,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 			fragmented = true
 			mimeType = "video/mp4"
 		}
-		codecString = probeCodecs(filePath)
-		videoWidth, videoHeight, videoDuration = probeVideoDimensions(filePath)
+		codecString, videoWidth, videoHeight, videoDuration = probeVideoInfo(filePath)
 	}
 
 	// Hash modification — skip for fMP4 remuxed videos (would break container)
@@ -304,15 +314,19 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		// Non-fatal if unsupported format — continue with unmodified file
 	}
 
-	// Generate thumbnail from file (no full-file read needed)
-	thumbData := generateThumbnail(filePath)
+	// Wait for thumbnail if running concurrently, or generate synchronously
+	if mediaType == "video" {
+		thumbWg.Wait()
+	} else {
+		thumbData = generateThumbnail(filePath)
+	}
 
 	// Get file size from source
 	srcInfo, err := os.Stat(srcPath)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
-	fileSize := int(srcInfo.Size())
+	fileSize := srcInfo.Size()
 
 	// Compute segment boundaries from the source file.
 	// For fMP4: scan moof box boundaries.
@@ -321,16 +335,16 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if fragmented {
 		segments = scanFMP4Segments(srcPath)
 	} else {
-		for start := int64(0); start < int64(fileSize); start += int64(chunkSize) {
+		for start := int64(0); start < fileSize; start += int64(chunkSize) {
 			length := int64(chunkSize)
-			if start+length > int64(fileSize) {
-				length = int64(fileSize) - start
+			if start+length > fileSize {
+				length = fileSize - start
 			}
 			segments = append(segments, segment{start, length})
 		}
 	}
 	if len(segments) == 0 {
-		segments = []segment{{0, int64(fileSize)}}
+		segments = []segment{{0, fileSize}}
 	}
 	chunkCount := len(segments)
 
@@ -418,7 +432,13 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
+	// WaitGroup ensures the goroutine has finished before uploadFile returns,
+	// preventing a race where deferred zeroBytes(fileKey) runs while the
+	// goroutine is still using fileKey to initialize the cipher.
+	var uploadWg sync.WaitGroup
+	uploadWg.Add(1)
 	go func() {
+		defer uploadWg.Done()
 		defer srcFile.Close()
 		var writeErr error
 		defer func() { pw.CloseWithError(writeErr) }()
@@ -442,6 +462,11 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		}
 
 		// Read each segment from disk, encrypt, write to pipe
+		gcm, err := crypto.NewChunkCipher(fileKey)
+		if err != nil {
+			writeErr = fmt.Errorf("init cipher: %w", err)
+			return
+		}
 		buf := make([]byte, 0, chunkSize+chunkSize/2) // reusable read buffer
 		for i, seg := range segments {
 			if cap(buf) < int(seg.length) {
@@ -452,7 +477,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 				writeErr = fmt.Errorf("read chunk %d: %w", i, err)
 				return
 			}
-			enc, err := crypto.EncryptChunk(buf, fileKey, i, mediaID)
+			enc, err := crypto.EncryptChunkWith(gcm, buf, i, mediaID)
 			if err != nil {
 				writeErr = fmt.Errorf("encrypt chunk %d: %w", i, err)
 				return
@@ -477,6 +502,9 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := client.Do(req)
+	// Wait for the upload goroutine to finish before returning, so deferred
+	// key zeroing doesn't race with the goroutine's reads.
+	uploadWg.Wait()
 	if err != nil {
 		return fmt.Errorf("upload request: %w", err)
 	}
@@ -595,57 +623,75 @@ func scanFMP4Segments(filePath string) []segment {
 	return segments
 }
 
-// probeCodecs uses ffprobe to determine video and audio codecs, returning a
-// codec string suitable for MSE (e.g. "avc1.64001f,mp4a.40.2"). Returns a
-// reasonable default if ffprobe is unavailable.
-func probeCodecs(filePath string) string {
+// probeVideoInfo uses a single ffprobe call to get video codec, audio codec,
+// dimensions, and duration. Returns (codecString, width, height, duration).
+func probeVideoInfo(filePath string) (string, int, int, float64) {
 	ffprobe, err := exec.LookPath("ffprobe")
 	if err != nil {
-		return "avc1.64001f,mp4a.40.2"
+		return "avc1.64001f,mp4a.40.2", 0, 0, 0
 	}
 
-	// Probe video codec
-	videoCodec := probeStreamCodec(ffprobe, filePath, "v:0")
-	audioCodec := probeStreamCodec(ffprobe, filePath, "a:0")
-
-	videoMSE := mapVideoCodec(videoCodec)
-	audioMSE := mapAudioCodec(audioCodec)
-
-	if videoMSE != "" && audioMSE != "" {
-		return videoMSE + "," + audioMSE
+	type streamInfo struct {
+		CodecName string `json:"codec_name"`
+		CodecType string `json:"codec_type"`
+		Width     int    `json:"width"`
+		Height    int    `json:"height"`
 	}
-	if videoMSE != "" {
-		return videoMSE
-	}
-	return "avc1.64001f,mp4a.40.2"
-}
-
-func probeStreamCodec(ffprobe, filePath, stream string) string {
 	type ffprobeResult struct {
-		Streams []struct {
-			CodecName string `json:"codec_name"`
-		} `json:"streams"`
+		Streams []streamInfo `json:"streams"`
+		Format  struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, ffprobe,
 		"-v", "quiet",
-		"-select_streams", stream,
-		"-show_entries", "stream=codec_name",
+		"-show_entries", "stream=codec_name,codec_type,width,height:format=duration",
 		"-of", "json",
 		filePath,
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		return "avc1.64001f,mp4a.40.2", 0, 0, 0
 	}
 
 	var result ffprobeResult
-	if err := json.Unmarshal(out, &result); err != nil || len(result.Streams) == 0 {
-		return ""
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "avc1.64001f,mp4a.40.2", 0, 0, 0
 	}
-	return result.Streams[0].CodecName
+
+	var videoCodec, audioCodec string
+	var w, h int
+	for _, s := range result.Streams {
+		switch s.CodecType {
+		case "video":
+			if videoCodec == "" {
+				videoCodec = s.CodecName
+				w = s.Width
+				h = s.Height
+			}
+		case "audio":
+			if audioCodec == "" {
+				audioCodec = s.CodecName
+			}
+		}
+	}
+
+	videoMSE := mapVideoCodec(videoCodec)
+	audioMSE := mapAudioCodec(audioCodec)
+	codecString := videoMSE
+	if audioMSE != "" {
+		codecString += "," + audioMSE
+	}
+
+	var dur float64
+	if result.Format.Duration != "" {
+		fmt.Sscanf(result.Format.Duration, "%f", &dur)
+	}
+
+	return codecString, w, h, dur
 }
 
 func mapVideoCodec(codec string) string {
@@ -677,56 +723,6 @@ func mapAudioCodec(codec string) string {
 		}
 		return ""
 	}
-}
-
-// probeVideoDimensions uses ffprobe to get video width, height, and duration.
-func probeVideoDimensions(filePath string) (int, int, float64) {
-	ffprobe, err := exec.LookPath("ffprobe")
-	if err != nil {
-		return 0, 0, 0
-	}
-
-	type ffprobeResult struct {
-		Streams []struct {
-			Width  int `json:"width"`
-			Height int `json:"height"`
-		} `json:"streams"`
-		Format struct {
-			Duration string `json:"duration"`
-		} `json:"format"`
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), subprocessTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, ffprobe,
-		"-v", "quiet",
-		"-select_streams", "v:0",
-		"-show_entries", "stream=width,height:format=duration",
-		"-of", "json",
-		filePath,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, 0, 0
-	}
-
-	var result ffprobeResult
-	if err := json.Unmarshal(out, &result); err != nil {
-		return 0, 0, 0
-	}
-
-	var w, h int
-	if len(result.Streams) > 0 {
-		w = result.Streams[0].Width
-		h = result.Streams[0].Height
-	}
-
-	var dur float64
-	if result.Format.Duration != "" {
-		fmt.Sscanf(result.Format.Duration, "%f", &dur)
-	}
-
-	return w, h, dur
 }
 
 func generateThumbnail(filePath string) []byte {
@@ -765,13 +761,7 @@ func generateImageThumbnailFromFile(filePath string) []byte {
 	}
 
 	thumb := image.NewRGBA(image.Rect(0, 0, tw, th))
-	for y := 0; y < th; y++ {
-		for x := 0; x < tw; x++ {
-			srcX := x * w / tw + bounds.Min.X
-			srcY := y * h / th + bounds.Min.Y
-			thumb.Set(x, y, img.At(srcX, srcY))
-		}
-	}
+	draw.ApproxBiLinear.Scale(thumb, thumb.Bounds(), img, bounds, draw.Over, nil)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 70}); err != nil {
@@ -974,6 +964,7 @@ type connFlags struct {
 	serverURL string
 	username  string
 	password  []byte // []byte so it can be zeroed after use
+	insecure  bool   // allow plaintext HTTP for non-localhost
 }
 
 func parseConnFlags(args []string) (connFlags, []string) {
@@ -993,6 +984,8 @@ func parseConnFlags(args []string) (connFlags, []string) {
 				fatal("-user requires a value")
 			}
 			cf.username = args[i]
+		case "-insecure":
+			cf.insecure = true
 		default:
 			rest = append(rest, args[i])
 		}
@@ -1009,15 +1002,50 @@ func parseConnFlags(args []string) (connFlags, []string) {
 		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
 		os.Exit(1)
 	}
+	validateServerURL(cf.serverURL)
+	requireHTTPS(cf.serverURL, cf.insecure)
 	return cf, rest
+}
+
+// requireHTTPS blocks plaintext HTTP for non-localhost URLs unless -insecure is set.
+func requireHTTPS(serverURL string, insecure bool) {
+	if !strings.HasPrefix(serverURL, "http://") {
+		return // HTTPS or other — already validated by validateServerURL
+	}
+	if strings.HasPrefix(serverURL, "http://localhost") ||
+		strings.HasPrefix(serverURL, "http://127.0.0.1") ||
+		strings.HasPrefix(serverURL, "http://[::1]") {
+		return // localhost is exempt
+	}
+	if insecure {
+		fmt.Fprintln(os.Stderr, "WARNING: Using plaintext HTTP. Credentials and encryption keys will be sent unencrypted.")
+		return
+	}
+	fatal("Refusing plaintext HTTP for non-localhost URL.\n  Use HTTPS, or pass -insecure to override.")
+}
+
+// validateServerURL ensures the server URL uses http or https scheme.
+func validateServerURL(serverURL string) {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		fatal("invalid server URL: %v", err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		// ok
+	default:
+		fatal("server URL must use http:// or https:// scheme, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		fatal("server URL must include a host")
+	}
 }
 
 // login authenticates and returns (token, masterKey). Caller must zeroBytes(masterKey).
 // Zeroes the password in cf after use.
 func login(cf connFlags) (string, []byte) {
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	// Build JSON manually to avoid string copies from json.Marshal
-	jsonBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, cf.username, string(cf.password))
+	jsonBody, _ := json.Marshal(map[string]string{"username": cf.username, "password": string(cf.password)})
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
 	zeroBytes(jsonBody)
 	if err != nil {
@@ -1072,7 +1100,7 @@ type mediaMetadata struct {
 	Name       string  `json:"name"`
 	MediaType  string  `json:"media_type"`
 	MimeType   string  `json:"mime_type"`
-	Size       int     `json:"size"`
+	Size       int64   `json:"size"`
 	ChunkCount int     `json:"chunk_count"`
 	Width      int     `json:"width,omitempty"`
 	Height     int     `json:"height,omitempty"`
@@ -1284,6 +1312,16 @@ func cmdDownload() {
 			err   error
 		}
 
+		gcm, gcmErr := crypto.NewChunkCipher(fileKey)
+		if gcmErr != nil {
+			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+			zeroBytes(fileKey)
+			outFile.Close()
+			os.Remove(outPath)
+			continue
+		}
+
 		results := make([]chan chunkResult, meta.ChunkCount)
 		for ci := range results {
 			results[ci] = make(chan chunkResult, 1)
@@ -1311,20 +1349,31 @@ func cmdDownload() {
 					results[ci] <- res
 					return
 				}
-				paddedData, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+				// Read length prefix, then only the real data (skip padding)
+				var lenBuf [4]byte
+				if _, err := io.ReadFull(resp.Body, lenBuf[:]); err != nil {
+					resp.Body.Close()
+					res.err = fmt.Errorf("read length prefix: %w", err)
+					results[ci] <- res
+					return
+				}
+				realLen := binary.BigEndian.Uint32(lenBuf[:])
+				if realLen > 20<<20 {
+					resp.Body.Close()
+					res.err = fmt.Errorf("chunk too large: %d", realLen)
+					results[ci] <- res
+					return
+				}
+				encrypted := make([]byte, realLen)
+				if _, err := io.ReadFull(resp.Body, encrypted); err != nil {
+					resp.Body.Close()
+					res.err = fmt.Errorf("read chunk data: %w", err)
+					results[ci] <- res
+					return
+				}
+				io.Copy(io.Discard, resp.Body) // drain padding
 				resp.Body.Close()
-				if err != nil {
-					res.err = err
-					results[ci] <- res
-					return
-				}
-				encrypted, err := stripPadding(paddedData)
-				if err != nil {
-					res.err = err
-					results[ci] <- res
-					return
-				}
-				plaintext, err := crypto.DecryptChunk(encrypted, fileKey, ci, item.ID)
+				plaintext, err := crypto.DecryptChunkWith(gcm, encrypted, ci, item.ID)
 				if err != nil {
 					res.err = err
 					results[ci] <- res
@@ -1367,7 +1416,7 @@ func cmdDownload() {
 	}
 }
 
-func formatSize(bytes int) string {
+func formatSize(bytes int64) string {
 	if bytes < 1024 {
 		return fmt.Sprintf("%d B", bytes)
 	}

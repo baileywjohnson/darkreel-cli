@@ -32,6 +32,17 @@ func DecryptChunk(ciphertext, key []byte, chunkIndex int, mediaID string) ([]byt
 	return DecryptBlock(ciphertext, key, aad)
 }
 
+// DecryptChunkWith decrypts a chunk using a pre-initialized GCM cipher.
+func DecryptChunkWith(gcm cipher.AEAD, ciphertext []byte, chunkIndex int, mediaID string) ([]byte, error) {
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize+gcm.Overhead() {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	aad := ChunkAAD(mediaID, chunkIndex)
+	return gcm.Open(nil, nonce, ct, aad)
+}
+
 // DecryptKey decrypts a file key with the user's master key.
 func DecryptKey(encryptedKey, masterKey, mediaID []byte) ([]byte, error) {
 	return DecryptBlock(encryptedKey, masterKey, mediaID)

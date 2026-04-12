@@ -46,6 +46,10 @@ sudo mv darkreel-cli /usr/local/bin/
 curl -fSL -o darkreel-cli https://github.com/baileywjohnson/darkreel-cli/releases/latest/download/darkreel-cli-darwin-amd64
 chmod +x darkreel-cli
 sudo mv darkreel-cli /usr/local/bin/
+
+# Verify checksum (recommended)
+curl -fSL -o SHA256SUMS https://github.com/baileywjohnson/darkreel-cli/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 ### From source
@@ -70,6 +74,7 @@ darkreel-cli download [flags] [-o DIR] [ID...]
 |------|-------------|
 | `-server` | Darkreel server URL (e.g., `https://media.example.com`) |
 | `-user` | Username |
+| `-insecure` | Allow plaintext HTTP for non-localhost URLs (blocked by default) |
 
 ### Upload flags
 
@@ -189,7 +194,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), and Windows (amd64).
+GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), and Windows (amd64). Each release includes a `SHA256SUMS` file for verifying binary integrity.
 
 ## Security
 
@@ -203,6 +208,11 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **No shell execution** — all subprocesses (ffmpeg, ffprobe) spawned via `exec.Command` with argument arrays, never through a shell
 - **Absolute paths for subprocesses** — file paths resolved to absolute before passing to ffmpeg/ffprobe, preventing `-` prefix filenames from being interpreted as flags
 - **Chunk download limits** — response bodies capped at 20 MB per chunk to prevent memory exhaustion from a malicious server
+- **Response body limits** — login responses capped at 1 MB, media list responses at 5 MB, preventing memory exhaustion from a malicious server on success paths
+- **HTTPS enforced by default** — plaintext HTTP is blocked for non-localhost URLs unless `-insecure` is explicitly passed. Localhost (`127.0.0.1`, `::1`, `localhost`) is exempt. Prevents accidental credential transmission in the clear
+- **URL scheme validation** — server URLs are validated to use only `http://` or `https://` schemes, rejecting `file://`, `ftp://`, and other exotic schemes that could be used to exfiltrate credentials
+- **HTTP redirect protection** — all HTTP clients disable redirect following, preventing a compromised or MITM'd server from redirecting API requests to leak the Authorization header
+- **Subprocess timeouts** — all ffmpeg and ffprobe invocations have a 10-minute timeout via `exec.CommandContext`, preventing indefinite hangs on malformed or adversarially crafted files
 - **HTTP status validation** — all API responses checked for expected status codes before processing
 - **Temp file cleanup** — all temporary files (fMP4 remux, hash modification) cleaned up via `defer`, even on error paths
 
