@@ -24,3 +24,15 @@ func DecryptBlock(ciphertext, key, aad []byte) ([]byte, error) {
 	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	return gcm.Open(nil, nonce, ct, aad)
 }
+
+// DecryptChunk decrypts a single encrypted chunk.
+// The mediaID and chunkIndex must match the values used during encryption.
+func DecryptChunk(ciphertext, key []byte, chunkIndex int, mediaID string) ([]byte, error) {
+	aad := ChunkAAD(mediaID, chunkIndex)
+	return DecryptBlock(ciphertext, key, aad)
+}
+
+// DecryptKey decrypts a file key with the user's master key.
+func DecryptKey(encryptedKey, masterKey, mediaID []byte) ([]byte, error) {
+	return DecryptBlock(encryptedKey, masterKey, mediaID)
+}

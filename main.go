@@ -29,6 +29,12 @@ import (
 
 const chunkSize = 1 << 20 // 1 MB — used for non-fragmented files only
 
+// segment describes a byte range in a source file.
+type segment struct {
+	offset int64
+	length int64
+}
+
 type loginResponse struct {
 	Token              string `json:"token"`
 	KDFSalt            string `json:"kdf_salt"`
@@ -45,6 +51,10 @@ func main() {
 	switch os.Args[1] {
 	case "upload":
 		cmdUpload()
+	case "list":
+		cmdList()
+	case "download":
+		cmdDownload()
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -59,6 +69,8 @@ func printUsage() {
 
 Usage:
   drk upload -server URL -user USERNAME FILE [FILE...]
+  drk list -server URL -user USERNAME
+  drk download -server URL -user USERNAME [-o DIR] [ID...]
 
 Environment variables:
   DRK_PASS    Password (required; not accepted as a CLI flag for security)
@@ -67,11 +79,18 @@ Environment variables:
 
 Commands:
   upload    Encrypt and upload files to a Darkreel server
+  list      List all media items (decrypts filenames)
+  download  Download and decrypt media items by ID (or all if no IDs given)
 
-Upload flags:
+Common flags:
   -server   Server URL (e.g., http://localhost:8080)
   -user     Username
-  -register Register a new account before uploading`)
+
+Upload flags:
+  -register Register a new account before uploading
+
+Download flags:
+  -o        Output directory (default: current directory)`)
 }
 
 func cmdUpload() {
@@ -114,9 +133,10 @@ func cmdUpload() {
 		username = os.Getenv("DRK_USER")
 	}
 	// Password must come from environment variable only (never a CLI flag)
-	password := os.Getenv("DRK_PASS")
+	password := []byte(os.Getenv("DRK_PASS"))
+	os.Unsetenv("DRK_PASS") // remove from process environment immediately
 
-	if serverURL == "" || username == "" || password == "" {
+	if serverURL == "" || username == "" || len(password) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
 		os.Exit(1)
 	}
@@ -140,15 +160,16 @@ func cmdUpload() {
 	// Register if requested
 	if register {
 		fmt.Printf("Registering user %q...\n", username)
-		body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-		resp, err := authClient.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(body))
+		regBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, username, string(password))
+		resp, err := authClient.Post(serverURL+"/api/auth/register", "application/json", bytes.NewReader(regBody))
+		zeroBytes(regBody)
 		if err != nil {
 			fatal("register request failed: %v", err)
 		}
 		if resp.StatusCode != 201 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			fatal("register failed (%d): %s", resp.StatusCode, string(b))
+			fatal("register failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 		}
 		resp.Body.Close()
 		fmt.Println("Registered successfully.")
@@ -156,15 +177,16 @@ func cmdUpload() {
 
 	// Login
 	fmt.Printf("Logging in as %q...\n", username)
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(body))
+	loginBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, username, string(password))
+	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(loginBody))
+	zeroBytes(loginBody)
 	if err != nil {
 		fatal("login request failed: %v", err)
 	}
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		fatal("login failed (%d): %s", resp.StatusCode, string(b))
+		fatal("login failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 	}
 
 	var loginResp loginResponse
@@ -175,6 +197,7 @@ func cmdUpload() {
 
 	// Derive master key: decrypt the encrypted master key from server
 	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password, loginResp.KDFSalt, loginResp.UserID)
+	zeroBytes(password)
 	if err != nil {
 		fatal("failed to decrypt master key: %v", err)
 	}
@@ -202,7 +225,7 @@ func cmdUpload() {
 	}
 }
 
-func decryptMasterKey(encB64, password, kdfSaltB64, userID string) ([]byte, error) {
+func decryptMasterKey(encB64 string, password []byte, kdfSaltB64, userID string) ([]byte, error) {
 	encData, err := base64.StdEncoding.DecodeString(encB64)
 	if err != nil {
 		return nil, err
@@ -211,16 +234,18 @@ func decryptMasterKey(encB64, password, kdfSaltB64, userID string) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("invalid kdf_salt: %w", err)
 	}
-	sessionKey := pbkdf2.Key([]byte(password), kdfSalt, 600000, 32, sha256.New)
+	sessionKey := pbkdf2.Key(password, kdfSalt, 600000, 32, sha256.New)
 	defer zeroBytes(sessionKey)
 
 	return crypto.DecryptBlock(encData, sessionKey, []byte(userID))
 }
 
 func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, filePath string) error {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
+	// Resolve to absolute path so filenames starting with "-" aren't
+	// interpreted as flags by ffmpeg/ffprobe.
+	absPath, err := filepath.Abs(filePath)
+	if err == nil {
+		filePath = absPath
 	}
 
 	ext := strings.ToLower(filepath.Ext(filePath))
@@ -228,21 +253,33 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-	mediaType := "image"
-	if isVideo(ext) {
+	mediaType := "file"
+	if isImage(ext) {
+		mediaType = "image"
+	} else if isVideo(ext) {
 		mediaType = "video"
 	}
 
-	// For videos, attempt fMP4 remux and codec probing
+	// srcPath is the file we'll read chunks from. It may be the original,
+	// a hash-modified temp file, or an fMP4-remuxed temp file.
+	srcPath := filePath
+	var tmpCleanup []string
+	defer func() {
+		for _, p := range tmpCleanup {
+			os.Remove(p)
+		}
+	}()
+
 	fragmented := false
 	codecString := ""
 	var videoWidth, videoHeight int
 	var videoDuration float64
 
 	if mediaType == "video" {
-		fmp4Data, ok := remuxToFMP4(filePath)
+		fmp4Path, ok := remuxToFMP4File(filePath)
 		if ok {
-			data = fmp4Data
+			tmpCleanup = append(tmpCleanup, fmp4Path)
+			srcPath = fmp4Path
 			fragmented = true
 			mimeType = "video/mp4"
 		}
@@ -252,23 +289,45 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 
 	// Hash modification — skip for fMP4 remuxed videos (would break container)
 	var hashNonce []byte
-	if fragmented {
-		hashNonce = nil
-	} else {
-		hashNonce, err = crypto.GenerateHashNonce()
-		if err != nil {
-			return err
+	if !fragmented {
+		tmpHash, nonce, err := modifyHashToFile(srcPath, mimeType)
+		if err == nil {
+			tmpCleanup = append(tmpCleanup, tmpHash)
+			srcPath = tmpHash
+			hashNonce = nonce
 		}
-		data, err = crypto.ModifyHash(data, mimeType, hashNonce)
-		if err != nil {
-			// Non-fatal; continue with unmodified data
-			data, _ = os.ReadFile(filePath)
-			hashNonce = nil
-		}
+		// Non-fatal if unsupported format — continue with unmodified file
 	}
 
-	// Generate thumbnail
-	thumbData := generateThumbnail(data, mimeType, filePath)
+	// Generate thumbnail from file (no full-file read needed)
+	thumbData := generateThumbnail(filePath)
+
+	// Get file size from source
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	fileSize := int(srcInfo.Size())
+
+	// Compute segment boundaries from the source file.
+	// For fMP4: scan moof box boundaries.
+	// For non-fMP4: fixed 1 MB chunks.
+	var segments []segment
+	if fragmented {
+		segments = scanFMP4Segments(srcPath)
+	} else {
+		for start := int64(0); start < int64(fileSize); start += int64(chunkSize) {
+			length := int64(chunkSize)
+			if start+length > int64(fileSize) {
+				length = int64(fileSize) - start
+			}
+			segments = append(segments, segment{start, length})
+		}
+	}
+	if len(segments) == 0 {
+		segments = []segment{{0, int64(fileSize)}}
+	}
+	chunkCount := len(segments)
 
 	// Generate keys
 	fileKey, err := crypto.GenerateFileKey()
@@ -283,42 +342,14 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	}
 	defer zeroBytes(thumbKey)
 
-	// Generate media ID first — needed as AAD for chunk and key encryption
 	mediaID := uuid.New().String()
 	mediaIDBytes := []byte(mediaID)
 
-	// Encrypt thumbnail
 	encThumb, err := crypto.EncryptChunk(thumbData, thumbKey, 0, mediaID)
 	if err != nil {
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 
-	// Split into segments: fMP4 at moof boundaries, otherwise fixed 1 MB chunks
-	var segments [][]byte
-	if fragmented {
-		segments = splitFMP4Segments(data)
-	} else {
-		for start := 0; start < len(data); start += chunkSize {
-			end := start + chunkSize
-			if end > len(data) {
-				end = len(data)
-			}
-			segments = append(segments, data[start:end])
-		}
-	}
-	chunkCount := len(segments)
-
-	// Encrypt segments
-	encChunks := make([][]byte, chunkCount)
-	for i, seg := range segments {
-		enc, err := crypto.EncryptChunk(seg, fileKey, i, mediaID)
-		if err != nil {
-			return fmt.Errorf("encrypt chunk %d: %w", i, err)
-		}
-		encChunks[i] = enc
-	}
-
-	// Encrypt keys with master key, bound to this media item via AAD
 	encFileKey, err := crypto.EncryptKey(fileKey, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
@@ -328,12 +359,11 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		return err
 	}
 
-	// Build and encrypt the metadata blob (name, type, mime, size, etc.)
 	metaMap := map[string]any{
 		"name":        filepath.Base(filePath),
 		"media_type":  mediaType,
 		"mime_type":   mimeType,
-		"size":        len(data),
+		"size":        fileSize,
 		"chunk_count": chunkCount,
 	}
 	if fragmented {
@@ -357,12 +387,10 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if err != nil {
 		return err
 	}
-	// EncryptBlock returns nonce || ciphertext || tag. Split nonce (first 12 bytes) from rest.
 	metadataNonce := metadataEnc[:12]
 	metadataCiphertext := metadataEnc[12:]
 
-	// Build upload metadata
-	meta := map[string]any{
+	uploadMeta := map[string]any{
 		"media_id":       mediaID,
 		"chunk_count":    chunkCount,
 		"file_key_enc":   base64.StdEncoding.EncodeToString(encFileKey),
@@ -371,35 +399,72 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		"metadata_nonce": base64.StdEncoding.EncodeToString(metadataNonce),
 	}
 	if len(hashNonce) > 0 {
-		meta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
+		uploadMeta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
 	}
 
-	// Build multipart body
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	metaPart, err := writer.CreateFormField("metadata")
+	// Stream the multipart body via io.Pipe. Each segment is read from the
+	// source file, encrypted, and written directly to the pipe — only one
+	// chunk is in memory at a time.
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
-	json.NewEncoder(metaPart).Encode(meta)
 
-	thumbPart, err := writer.CreateFormField("thumbnail")
-	if err != nil {
-		return err
-	}
-	thumbPart.Write(encThumb)
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
 
-	for i, chunk := range encChunks {
-		chunkPart, err := writer.CreateFormField(fmt.Sprintf("chunk_%d", i))
+	go func() {
+		defer srcFile.Close()
+		var writeErr error
+		defer func() { pw.CloseWithError(writeErr) }()
+
+		metaPart, err := writer.CreateFormField("metadata")
 		if err != nil {
-			return err
+			writeErr = err
+			return
 		}
-		chunkPart.Write(chunk)
-	}
-	writer.Close()
+		if writeErr = json.NewEncoder(metaPart).Encode(uploadMeta); writeErr != nil {
+			return
+		}
 
-	req, err := http.NewRequest("POST", serverURL+"/api/media/upload", &buf)
+		thumbPart, err := writer.CreateFormField("thumbnail")
+		if err != nil {
+			writeErr = err
+			return
+		}
+		if _, writeErr = thumbPart.Write(encThumb); writeErr != nil {
+			return
+		}
+
+		// Read each segment from disk, encrypt, write to pipe
+		buf := make([]byte, 0, chunkSize+chunkSize/2) // reusable read buffer
+		for i, seg := range segments {
+			if cap(buf) < int(seg.length) {
+				buf = make([]byte, seg.length)
+			}
+			buf = buf[:seg.length]
+			if _, err := srcFile.ReadAt(buf, seg.offset); err != nil {
+				writeErr = fmt.Errorf("read chunk %d: %w", i, err)
+				return
+			}
+			enc, err := crypto.EncryptChunk(buf, fileKey, i, mediaID)
+			if err != nil {
+				writeErr = fmt.Errorf("encrypt chunk %d: %w", i, err)
+				return
+			}
+			chunkPart, err := writer.CreateFormField(fmt.Sprintf("chunk_%d", i))
+			if err != nil {
+				writeErr = err
+				return
+			}
+			if _, writeErr = chunkPart.Write(enc); writeErr != nil {
+				return
+			}
+		}
+		writeErr = writer.Close()
+	}()
+
+	req, err := http.NewRequest("POST", serverURL+"/api/media/upload", pr)
 	if err != nil {
 		return err
 	}
@@ -414,29 +479,27 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 
 	if resp.StatusCode != 201 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("server error (%d): %s", resp.StatusCode, string(b))
+		return fmt.Errorf("server error (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 	}
 
 	return nil
 }
 
-// remuxToFMP4 remuxes the video at filePath to fragmented MP4 using ffmpeg.
-// Returns the fMP4 data and true on success, or nil and false if ffmpeg is
-// unavailable or the remux fails.
-func remuxToFMP4(filePath string) ([]byte, bool) {
+// remuxToFMP4File remuxes the video at filePath to fragmented MP4 using ffmpeg.
+// Returns the temp file path and true on success. Caller must remove the temp file.
+func remuxToFMP4File(filePath string) (string, bool) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n    (ffmpeg not found — skipping fMP4 remux)\n    ")
-		return nil, false
+		return "", false
 	}
 
 	tmpFile, err := os.CreateTemp("", "drk-fmp4-*.mp4")
 	if err != nil {
-		return nil, false
+		return "", false
 	}
 	tmpPath := tmpFile.Name()
 	tmpFile.Close()
-	defer os.Remove(tmpPath)
 
 	cmd := exec.Command(ffmpeg,
 		"-y",
@@ -450,15 +513,79 @@ func remuxToFMP4(filePath string) ([]byte, bool) {
 	cmd.Stdout = nil
 
 	if err := cmd.Run(); err != nil {
+		os.Remove(tmpPath)
 		fmt.Fprintf(os.Stderr, "\n    (fMP4 remux failed — using original file)\n    ")
-		return nil, false
+		return "", false
 	}
 
-	data, err := os.ReadFile(tmpPath)
+	return tmpPath, true
+}
+
+// scanFMP4Segments scans an fMP4 file for moof boundaries and returns
+// segment offsets. The first segment is the init segment (everything before
+// the first moof), subsequent segments are moof+mdat pairs.
+func scanFMP4Segments(filePath string) []segment {
+	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, false
+		return nil
 	}
-	return data, true
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	fileSize := info.Size()
+
+	var header [16]byte
+	var segments []segment
+	var moofOffsets []int64
+	pos := int64(0)
+
+	for pos < fileSize {
+		if _, err := f.ReadAt(header[:8], pos); err != nil {
+			break
+		}
+		boxSize := int64(binary.BigEndian.Uint32(header[:4]))
+		boxType := string(header[4:8])
+		if boxSize == 1 && pos+16 <= fileSize {
+			if _, err := f.ReadAt(header[:16], pos); err != nil {
+				break
+			}
+			boxSize = int64(binary.BigEndian.Uint64(header[8:16]))
+		}
+		if boxSize == 0 {
+			boxSize = fileSize - pos
+		}
+		if boxSize < 8 || pos+boxSize > fileSize {
+			break
+		}
+
+		if boxType == "moof" {
+			moofOffsets = append(moofOffsets, pos)
+		}
+		pos += boxSize
+	}
+
+	if len(moofOffsets) == 0 {
+		return []segment{{0, fileSize}}
+	}
+
+	// Init segment: everything before first moof
+	segments = append(segments, segment{0, moofOffsets[0]})
+
+	// Media segments: each moof to the next moof (or EOF)
+	for i, off := range moofOffsets {
+		var end int64
+		if i+1 < len(moofOffsets) {
+			end = moofOffsets[i+1]
+		} else {
+			end = fileSize
+		}
+		segments = append(segments, segment{off, end - off})
+	}
+
+	return segments
 }
 
 // probeCodecs uses ffprobe to determine video and audio codecs, returning a
@@ -591,15 +718,20 @@ func probeVideoDimensions(filePath string) (int, int, float64) {
 	return w, h, dur
 }
 
-func generateThumbnail(data []byte, mimeType, filePath string) []byte {
+func generateThumbnail(filePath string) []byte {
 	if isVideo(strings.ToLower(filepath.Ext(filePath))) {
 		return generateVideoThumbnail(filePath)
 	}
-	return generateImageThumbnail(data)
+	return generateImageThumbnailFromFile(filePath)
 }
 
-func generateImageThumbnail(data []byte) []byte {
-	img, _, err := image.Decode(bytes.NewReader(data))
+func generateImageThumbnailFromFile(filePath string) []byte {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return placeholderThumb()
+	}
+	defer f.Close()
+	img, _, err := image.Decode(f)
 	if err != nil {
 		return placeholderThumb()
 	}
@@ -684,73 +816,125 @@ func placeholderThumb() []byte {
 	return buf.Bytes()
 }
 
-// readBoxHeader reads an MP4 box header at the given position.
-// Returns the box size and 4-character type string.
-func readBoxHeader(data []byte, pos int) (size int, boxType string) {
-	if pos+8 > len(data) {
-		return 0, ""
+// modifyHashToFile applies hash modification by streaming: reads a small header
+// to compute the insertion point and blob, then writes [prefix][blob][rest] to
+// a temp file. Returns the temp file path (caller must remove) and the nonce.
+// Returns ("", nil, nil) if hash modification is not supported for the format.
+func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, err error) {
+	lower := strings.ToLower(mimeType)
+
+	// Read a small header to determine the insertion point
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", nil, err
 	}
-	size = int(binary.BigEndian.Uint32(data[pos : pos+4]))
-	boxType = string(data[pos+4 : pos+8])
-	if size == 1 && pos+16 <= len(data) {
-		// 64-bit extended size
-		size = int(binary.BigEndian.Uint64(data[pos+8 : pos+16]))
+	defer src.Close()
+
+	header := make([]byte, 64*1024)
+	n, _ := io.ReadFull(src, header)
+	header = header[:n]
+	if n < 8 {
+		return "", nil, fmt.Errorf("file too small")
 	}
-	if size == 0 {
-		size = len(data) - pos
+
+	nonce, err = crypto.GenerateHashNonce()
+	if err != nil {
+		return "", nil, err
 	}
-	return
+
+	// Determine the insertion point and the blob to insert, based on format.
+	// This reuses the same logic as the in-memory functions but only on the header.
+	var insertPos int
+	var blob []byte
+
+	switch {
+	case (strings.Contains(lower, "jpeg") || strings.Contains(lower, "jpg")) && header[0] == 0xFF && header[1] == 0xD8:
+		// JPEG: insert COM marker after SOI (2 bytes)
+		insertPos = 2
+		comLen := uint16(len(nonce) + 2)
+		blob = make([]byte, 4+len(nonce))
+		blob[0] = 0xFF
+		blob[1] = 0xFE
+		binary.BigEndian.PutUint16(blob[2:4], comLen)
+		copy(blob[4:], nonce)
+
+	case strings.Contains(lower, "png") && bytes.Equal(header[:8], []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}):
+		// PNG: insert tEXt chunk before first IDAT
+		pos := 8
+		for pos+8 <= n {
+			chunkLen := int(binary.BigEndian.Uint32(header[pos : pos+4]))
+			chunkType := string(header[pos+4 : pos+8])
+			if chunkType == "IDAT" {
+				break
+			}
+			pos += 12 + chunkLen
+		}
+		insertPos = pos
+		keyword := "darkreel"
+		textData := append([]byte(keyword), 0)
+		textData = append(textData, nonce...)
+		blob = crypto.BuildPNGChunkExported("tEXt", textData)
+
+	case (strings.Contains(lower, "mp4") || strings.Contains(lower, "quicktime")) && n >= 8:
+		// MP4: insert 'free' box after ftyp
+		insertPos = 0
+		if string(header[4:8]) == "ftyp" {
+			boxSize := int(binary.BigEndian.Uint32(header[0:4]))
+			if boxSize <= n {
+				insertPos = boxSize
+			}
+		}
+		boxSize := uint32(8 + len(nonce))
+		blob = make([]byte, boxSize)
+		binary.BigEndian.PutUint32(blob[0:4], boxSize)
+		copy(blob[4:8], "free")
+		copy(blob[8:], nonce)
+
+	default:
+		return "", nil, fmt.Errorf("unsupported format: %s", mimeType)
+	}
+
+	// Write to temp file: [prefix][blob][rest streamed from original]
+	tmp, err := os.CreateTemp("", "drk-hashmod-*")
+	if err != nil {
+		return "", nil, err
+	}
+	tmpPath = tmp.Name()
+
+	// Write prefix (bytes before insertion point)
+	if _, err := tmp.Write(header[:insertPos]); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", nil, err
+	}
+	// Write the injection blob
+	if _, err := tmp.Write(blob); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", nil, err
+	}
+	// Write the rest: first from header buffer, then stream from file
+	if _, err := tmp.Write(header[insertPos:]); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", nil, err
+	}
+	// Stream remaining file content (beyond what we read into header)
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", nil, err
+	}
+	tmp.Close()
+	return tmpPath, nonce, nil
 }
 
-// splitFMP4Segments splits fMP4 data at moof boundaries.
-// Returns [init_segment, segment_1, segment_2, ...] where the init segment
-// is everything before the first moof, and each media segment is a moof+mdat pair.
-func splitFMP4Segments(data []byte) [][]byte {
-	var segments [][]byte
-	pos := 0
-	initEnd := 0
-
-	for pos < len(data) {
-		size, boxType := readBoxHeader(data, pos)
-		if size == 0 || boxType == "" {
-			break
-		}
-		if pos+size > len(data) {
-			break
-		}
-
-		if boxType == "moof" {
-			if initEnd == 0 {
-				initEnd = pos
-			}
-			// moof + following mdat = one segment
-			moofEnd := pos + size
-			segEnd := moofEnd
-			// Check if next box is mdat
-			if moofEnd < len(data) {
-				nextSize, nextType := readBoxHeader(data, moofEnd)
-				if nextType == "mdat" && nextSize > 0 && moofEnd+nextSize <= len(data) {
-					segEnd = moofEnd + nextSize
-				}
-			}
-			segments = append(segments, data[pos:segEnd])
-			pos = segEnd
-			continue
-		}
-
-		pos += size
+func isImage(ext string) bool {
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+		return true
 	}
-
-	// Init segment is everything before first moof
-	if initEnd > 0 {
-		result := make([][]byte, 0, len(segments)+1)
-		result = append(result, data[:initEnd])
-		result = append(result, segments...)
-		return result
-	}
-
-	// No moof found — return as single chunk
-	return [][]byte{data}
+	return false
 }
 
 func isVideo(ext string) bool {
@@ -770,4 +954,415 @@ func zeroBytes(b []byte) {
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// connFlags holds parsed connection flags shared across commands.
+type connFlags struct {
+	serverURL string
+	username  string
+	password  []byte // []byte so it can be zeroed after use
+}
+
+func parseConnFlags(args []string) (connFlags, []string) {
+	var cf connFlags
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-server":
+			i++
+			if i >= len(args) {
+				fatal("-server requires a value")
+			}
+			cf.serverURL = strings.TrimRight(args[i], "/")
+		case "-user":
+			i++
+			if i >= len(args) {
+				fatal("-user requires a value")
+			}
+			cf.username = args[i]
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if cf.serverURL == "" {
+		cf.serverURL = strings.TrimRight(os.Getenv("DRK_SERVER"), "/")
+	}
+	if cf.username == "" {
+		cf.username = os.Getenv("DRK_USER")
+	}
+	cf.password = []byte(os.Getenv("DRK_PASS"))
+	os.Unsetenv("DRK_PASS") // remove from process environment immediately
+	if cf.serverURL == "" || cf.username == "" || len(cf.password) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
+		os.Exit(1)
+	}
+	return cf, rest
+}
+
+// login authenticates and returns (token, masterKey). Caller must zeroBytes(masterKey).
+// Zeroes the password in cf after use.
+func login(cf connFlags) (string, []byte) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	// Build JSON manually to avoid string copies from json.Marshal
+	jsonBody := fmt.Appendf(nil, `{"username":%q,"password":%q}`, cf.username, string(cf.password))
+	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
+	zeroBytes(jsonBody)
+	if err != nil {
+		fatal("login request failed: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		fatal("login failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
+	}
+	var lr loginResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		fatal("failed to parse login response: %v", err)
+	}
+	resp.Body.Close()
+
+	masterKey, err := decryptMasterKey(lr.EncryptedMasterKey, cf.password, lr.KDFSalt, lr.UserID)
+	zeroBytes(cf.password)
+	if err != nil {
+		fatal("failed to decrypt master key: %v", err)
+	}
+	return lr.Token, masterKey
+}
+
+// sanitizeServerResponse strips non-printable characters and truncates for safe display.
+func sanitizeServerResponse(b []byte) string {
+	const maxLen = 512
+	s := make([]byte, 0, len(b))
+	for _, c := range b {
+		if c >= 0x20 && c < 0x7F { // printable ASCII only
+			s = append(s, c)
+		}
+	}
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return string(s)
+}
+
+// apiMediaItem matches the JSON returned by GET /api/media.
+type apiMediaItem struct {
+	ID            string `json:"id"`
+	FileKeyEnc    string `json:"file_key_enc"`
+	ThumbKeyEnc   string `json:"thumb_key_enc"`
+	HashNonce     string `json:"hash_nonce"`
+	MetadataEnc   string `json:"metadata_enc"`
+	MetadataNonce string `json:"metadata_nonce"`
+	CreatedAt     string `json:"created_at"`
+}
+
+type mediaMetadata struct {
+	Name       string  `json:"name"`
+	MediaType  string  `json:"media_type"`
+	MimeType   string  `json:"mime_type"`
+	Size       int     `json:"size"`
+	ChunkCount int     `json:"chunk_count"`
+	Width      int     `json:"width,omitempty"`
+	Height     int     `json:"height,omitempty"`
+	Duration   float64 `json:"duration,omitempty"`
+}
+
+func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error) {
+	encData, err := base64.StdEncoding.DecodeString(item.MetadataEnc)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := base64.StdEncoding.DecodeString(item.MetadataNonce)
+	if err != nil {
+		return nil, err
+	}
+	// Reconstruct nonce||ciphertext for DecryptBlock
+	combined := make([]byte, len(nonce)+len(encData))
+	copy(combined, nonce)
+	copy(combined[len(nonce):], encData)
+	aad := []byte(item.ID)
+
+	plaintext, err := crypto.DecryptBlock(combined, masterKey, aad)
+	if err != nil {
+		return nil, err
+	}
+	var meta mediaMetadata
+	if err := json.Unmarshal(plaintext, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func fetchAllMedia(serverURL, token string) ([]apiMediaItem, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	var all []apiMediaItem
+	page := 1
+	const maxPages = 1000
+	for page <= maxPages {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/media?page=%d&limit=200", serverURL, page), nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(b))
+		}
+		var result struct {
+			Items []apiMediaItem `json:"items"`
+			Total int            `json:"total"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		all = append(all, result.Items...)
+		if len(all) >= result.Total || len(result.Items) == 0 {
+			break
+		}
+		page++
+	}
+	return all, nil
+}
+
+func cmdList() {
+	cf, _ := parseConnFlags(os.Args[2:])
+	token, masterKey := login(cf)
+	defer zeroBytes(masterKey)
+
+	items, err := fetchAllMedia(cf.serverURL, token)
+	if err != nil {
+		fatal("failed to list media: %v", err)
+	}
+
+	if len(items) == 0 {
+		fmt.Println("No media items found.")
+		return
+	}
+
+	fmt.Printf("%-36s  %-8s  %-10s  %s\n", "ID", "TYPE", "SIZE", "NAME")
+	for _, item := range items {
+		meta, err := decryptMetadata(item, masterKey)
+		if err != nil {
+			fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, "?", "?", "(decryption failed)")
+			continue
+		}
+		fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, meta.MediaType, formatSize(meta.Size), meta.Name)
+	}
+	fmt.Printf("\n%d items total\n", len(items))
+}
+
+// stripPadding extracts the real data from a padded chunk/thumbnail.
+// On-disk format: [4 bytes big-endian real length][data][random padding]
+func stripPadding(padded []byte) ([]byte, error) {
+	if len(padded) < 4 {
+		return nil, fmt.Errorf("padded data too short")
+	}
+	realLen := int(binary.BigEndian.Uint32(padded[:4]))
+	if realLen > len(padded)-4 {
+		return nil, fmt.Errorf("invalid padding length")
+	}
+	return padded[4 : 4+realLen], nil
+}
+
+func cmdDownload() {
+	args := os.Args[2:]
+	var outDir string
+	var filteredArgs []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-o" {
+			i++
+			if i >= len(args) {
+				fatal("-o requires a value")
+			}
+			outDir = args[i]
+		} else {
+			filteredArgs = append(filteredArgs, args[i])
+		}
+	}
+	cf, ids := parseConnFlags(filteredArgs)
+
+	if outDir == "" {
+		outDir = "."
+	}
+
+	token, masterKey := login(cf)
+	defer zeroBytes(masterKey)
+
+	items, err := fetchAllMedia(cf.serverURL, token)
+	if err != nil {
+		fatal("failed to list media: %v", err)
+	}
+
+	// Build a map for lookup
+	itemMap := make(map[string]apiMediaItem, len(items))
+	for _, item := range items {
+		itemMap[item.ID] = item
+	}
+
+	// If specific IDs given, download those; otherwise download all
+	var toDownload []apiMediaItem
+	if len(ids) > 0 {
+		for _, id := range ids {
+			item, ok := itemMap[id]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "Warning: item %s not found, skipping\n", id)
+				continue
+			}
+			toDownload = append(toDownload, item)
+		}
+	} else {
+		toDownload = items
+	}
+
+	if len(toDownload) == 0 {
+		fmt.Println("No items to download.")
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	success, fail := 0, 0
+
+	for i, item := range toDownload {
+		meta, err := decryptMetadata(item, masterKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [%d/%d] %s — decryption failed, skipping\n", i+1, len(toDownload), item.ID)
+			fail++
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s ", i+1, len(toDownload), meta.Name)
+
+		// Decrypt file key
+		fileKeyEnc, err := base64.StdEncoding.DecodeString(item.FileKeyEnc)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+			continue
+		}
+		fileKey, err := crypto.DecryptKey(fileKeyEnc, masterKey, []byte(item.ID))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+			continue
+		}
+
+		// Fetch and decrypt each chunk via the padded endpoint
+		// Sanitize filename to prevent path traversal from crafted metadata.
+		// filepath.Base strips directory components (e.g., "../../evil" → "evil").
+		safeName := filepath.Base(meta.Name)
+		if safeName == "." || safeName == ".." || safeName == "" {
+			safeName = item.ID // fallback to media ID
+		}
+		outPath := filepath.Join(outDir, safeName)
+		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+			zeroBytes(fileKey)
+			continue
+		}
+
+		// Fetch, decrypt, and write chunks. Uses a pipeline of concurrent
+		// fetchers feeding an ordered channel so writes stay sequential.
+		const dlWorkers = 4
+		type chunkResult struct {
+			index int
+			data  []byte
+			err   error
+		}
+
+		results := make([]chan chunkResult, meta.ChunkCount)
+		for ci := range results {
+			results[ci] = make(chan chunkResult, 1)
+		}
+
+		// Bounded worker pool: fetch + decrypt chunks concurrently
+		sem := make(chan struct{}, dlWorkers)
+		for ci := 0; ci < meta.ChunkCount; ci++ {
+			ci := ci
+			sem <- struct{}{}
+			go func() {
+				defer func() { <-sem }()
+				res := chunkResult{index: ci}
+				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/media/%s/chunk/%d", cf.serverURL, item.ID, ci), nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				resp, err := client.Do(req)
+				if err != nil {
+					res.err = err
+					results[ci] <- res
+					return
+				}
+				if resp.StatusCode != 200 {
+					resp.Body.Close()
+					res.err = fmt.Errorf("status %d", resp.StatusCode)
+					results[ci] <- res
+					return
+				}
+				paddedData, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+				resp.Body.Close()
+				if err != nil {
+					res.err = err
+					results[ci] <- res
+					return
+				}
+				encrypted, err := stripPadding(paddedData)
+				if err != nil {
+					res.err = err
+					results[ci] <- res
+					return
+				}
+				plaintext, err := crypto.DecryptChunk(encrypted, fileKey, ci, item.ID)
+				if err != nil {
+					res.err = err
+					results[ci] <- res
+					return
+				}
+				res.data = plaintext
+				results[ci] <- res
+			}()
+		}
+
+		// Write chunks in order
+		ok := true
+		for ci := 0; ci < meta.ChunkCount; ci++ {
+			res := <-results[ci]
+			if res.err != nil {
+				ok = false
+				break
+			}
+			if _, err := outFile.Write(res.data); err != nil {
+				ok = false
+				break
+			}
+		}
+		outFile.Close()
+		zeroBytes(fileKey)
+
+		if ok {
+			fmt.Fprintf(os.Stderr, "OK\n")
+			success++
+		} else {
+			os.Remove(outPath) // clean up partial file
+			fmt.Fprintf(os.Stderr, "FAILED\n")
+			fail++
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\nDone: %d downloaded, %d failed\n", success, fail)
+	if fail > 0 {
+		os.Exit(1)
+	}
+}
+
+func formatSize(bytes int) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	}
+	if bytes < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+	}
+	return fmt.Sprintf("%.1f GB", float64(bytes)/(1024*1024*1024))
 }

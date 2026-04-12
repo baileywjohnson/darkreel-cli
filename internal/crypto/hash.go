@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"strings"
 )
 
@@ -83,6 +84,11 @@ func modifyPNG(data []byte, nonce []byte) ([]byte, error) {
 	return result, nil
 }
 
+// BuildPNGChunkExported builds a PNG chunk with the given type and data.
+func BuildPNGChunkExported(chunkType string, chunkData []byte) []byte {
+	return buildPNGChunk(chunkType, chunkData)
+}
+
 func buildPNGChunk(chunkType string, chunkData []byte) []byte {
 	buf := make([]byte, 12+len(chunkData))
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(chunkData)))
@@ -94,23 +100,7 @@ func buildPNGChunk(chunkType string, chunkData []byte) []byte {
 }
 
 func crc32PNG(data []byte) uint32 {
-	var table [256]uint32
-	for i := 0; i < 256; i++ {
-		c := uint32(i)
-		for j := 0; j < 8; j++ {
-			if c&1 != 0 {
-				c = 0xEDB88320 ^ (c >> 1)
-			} else {
-				c >>= 1
-			}
-		}
-		table[i] = c
-	}
-	crc := uint32(0xFFFFFFFF)
-	for _, b := range data {
-		crc = table[byte(crc)^b] ^ (crc >> 8)
-	}
-	return crc ^ 0xFFFFFFFF
+	return crc32.ChecksumIEEE(data)
 }
 
 func modifyMP4(data []byte, nonce []byte) ([]byte, error) {
