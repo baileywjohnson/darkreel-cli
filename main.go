@@ -1414,15 +1414,19 @@ func cmdDownload() {
 			continue
 		}
 
-		results := make([]chan chunkResult, meta.ChunkCount)
-		for ci := range results {
-			results[ci] = make(chan chunkResult, 1)
+		// Sliding window of result channels — bounds memory to windowSize
+		// chunks ahead of the writer instead of buffering all chunks.
+		const windowSize = 2 * dlWorkers
+		window := make([]chan chunkResult, windowSize)
+		for i := range window {
+			window[i] = make(chan chunkResult, 1)
 		}
 
-		// Bounded worker pool: fetch + decrypt chunks concurrently
 		sem := make(chan struct{}, dlWorkers)
-		for ci := 0; ci < meta.ChunkCount; ci++ {
-			ci := ci
+		nextLaunch := 0
+
+		fetchChunk := func(ci int) {
+			slot := ci % windowSize
 			sem <- struct{}{}
 			go func() {
 				defer func() { <-sem }()
@@ -1432,13 +1436,13 @@ func cmdDownload() {
 				resp, err := client.Do(req)
 				if err != nil {
 					res.err = err
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				if resp.StatusCode != 200 {
 					resp.Body.Close()
 					res.err = fmt.Errorf("status %d", resp.StatusCode)
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				// Read length prefix, then only the real data (skip padding)
@@ -1446,21 +1450,21 @@ func cmdDownload() {
 				if _, err := io.ReadFull(resp.Body, lenBuf[:]); err != nil {
 					resp.Body.Close()
 					res.err = fmt.Errorf("read length prefix: %w", err)
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				realLen := binary.BigEndian.Uint32(lenBuf[:])
 				if realLen > 20<<20 {
 					resp.Body.Close()
 					res.err = fmt.Errorf("chunk too large: %d", realLen)
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				encrypted := make([]byte, realLen)
 				if _, err := io.ReadFull(resp.Body, encrypted); err != nil {
 					resp.Body.Close()
 					res.err = fmt.Errorf("read chunk data: %w", err)
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				io.Copy(io.Discard, io.LimitReader(resp.Body, 20<<20)) // drain padding
@@ -1468,18 +1472,24 @@ func cmdDownload() {
 				plaintext, err := crypto.DecryptChunkWith(gcm, encrypted, ci, item.ID)
 				if err != nil {
 					res.err = err
-					results[ci] <- res
+					window[slot] <- res
 					return
 				}
 				res.data = plaintext
-				results[ci] <- res
+				window[slot] <- res
 			}()
 		}
 
-		// Write chunks in order
+		// Seed the window with initial fetches
+		for nextLaunch < meta.ChunkCount && nextLaunch < windowSize {
+			fetchChunk(nextLaunch)
+			nextLaunch++
+		}
+
+		// Write chunks in order, launching new fetches as slots free up
 		ok := true
 		for ci := 0; ci < meta.ChunkCount; ci++ {
-			res := <-results[ci]
+			res := <-window[ci%windowSize]
 			if res.err != nil {
 				ok = false
 				break
@@ -1487,6 +1497,10 @@ func cmdDownload() {
 			if _, err := outFile.Write(res.data); err != nil {
 				ok = false
 				break
+			}
+			if nextLaunch < meta.ChunkCount {
+				fetchChunk(nextLaunch)
+				nextLaunch++
 			}
 		}
 		outFile.Close()
