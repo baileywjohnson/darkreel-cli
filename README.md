@@ -143,7 +143,7 @@ DRK_PASS=secret darkreel-cli upload -server https://media.example.com -user alic
    - **Hash modification:** Reads a small header (64 KB) from disk to determine the insertion point, streams the modified file to a temp file — the full file is never loaded into memory
    - Generates a 320px JPEG thumbnail from the file path (images: native decode, videos: ffmpeg)
    - Generates random 256-bit encryption keys for file and thumbnail
-   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key
+   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key. Metadata is padded to a power-of-2 bucket (minimum 512 bytes) before encryption, preventing blob size from leaking filename length or field presence
    - Computes segment boundaries — videos at fMP4 moof boundaries (scanned from file headers), other files at 1 MB
    - Streams the multipart upload via `io.Pipe`: each segment is read from disk, encrypted with AES-256-GCM (media ID + chunk index as AAD), and written directly to the HTTP request — only one chunk is in memory at a time
 
@@ -173,7 +173,7 @@ When a file is encrypted, a random 32-byte nonce is injected into the file's met
 | PNG | Inserts a tEXt chunk before IDAT |
 | MP4 | Appends a "free" box at the end of the file |
 
-Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification and are uploaded as-is. Hash modification is also skipped for fMP4-remuxed videos since it would break the container structure.
+Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification and are uploaded as-is. Hash modification is also skipped for fMP4-remuxed videos since it would break the container structure. A hash nonce is always generated and sent to the server regardless of format, so the server cannot distinguish modified from unmodified files by the presence or absence of the field.
 
 ## Supported formats
 
@@ -214,12 +214,14 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **HTTP redirect protection** — all HTTP clients disable redirect following, preventing a compromised or MITM'd server from redirecting API requests to leak the Authorization header
 - **Subprocess timeouts** — all ffmpeg and ffprobe invocations have a 10-minute timeout via `exec.CommandContext`, preventing indefinite hangs on malformed or adversarially crafted files
 - **HTTP status validation** — all API responses checked for expected status codes before processing
-- **Temp file cleanup** — all temporary files (fMP4 remux, hash modification) cleaned up via `defer`, even on error paths
+- **Temp file isolation** — each upload creates a private temp directory (0700 permissions), cleaned up atomically via `defer`. Temp files use non-identifying names, preventing other users or processes from observing upload activity or file types
 - **PNG parsing overflow protection** — hash modification for PNG files uses 64-bit arithmetic for chunk length calculations, preventing integer overflow on 32-bit systems and guarding against chunks extending beyond the 64 KB header buffer
 - **Chunk count validation** — downloaded media with invalid chunk counts (outside 1–50,000, matching the server limit) is rejected before allocating memory or spawning workers
 - **Media list pagination bounded** — the total number of items fetched from the server is capped at 50,000, preventing memory exhaustion from a malicious server returning unbounded pagination
 - **Server-provided IDs validated** — media item IDs from the server are validated as UUIDs before use in URL construction and decryption AAD
 - **Filename display sanitization** — filenames from decrypted metadata are stripped of control characters and ANSI escape sequences before terminal output, preventing terminal injection
+- **Metadata blob padding** — encrypted metadata blobs are padded to power-of-2 buckets (minimum 512 bytes) before encryption, preventing the encrypted blob size from revealing filename length or which optional fields are present
+- **Hash nonce always sent** — a random 32-byte hash nonce is always generated and sent to the server, even for formats that don't support hash modification. This prevents the server from inferring file format category by the presence or absence of the field
 - **Connection pool tuning** — download HTTP client's `MaxIdleConnsPerHost` matches the worker count (4), ensuring all parallel chunk fetches reuse connections instead of creating new ones
 
 ## Related projects

@@ -268,12 +268,11 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	// srcPath is the file we'll read chunks from. It may be the original,
 	// a hash-modified temp file, or an fMP4-remuxed temp file.
 	srcPath := filePath
-	var tmpCleanup []string
-	defer func() {
-		for _, p := range tmpCleanup {
-			os.Remove(p)
-		}
-	}()
+	tmpDir, err := os.MkdirTemp("", "")
+	if err != nil {
+		return fmt.Errorf("create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
 	fragmented := false
 	codecString := ""
@@ -287,14 +286,13 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		thumbWg.Add(1)
 		go func() {
 			defer thumbWg.Done()
-			thumbData = generateThumbnail(filePath)
+			thumbData = generateThumbnail(filePath, tmpDir)
 		}()
 	}
 
 	if mediaType == "video" {
-		fmp4Path, ok := remuxToFMP4File(filePath)
+		fmp4Path, ok := remuxToFMP4File(filePath, tmpDir)
 		if ok {
-			tmpCleanup = append(tmpCleanup, fmp4Path)
 			srcPath = fmp4Path
 			fragmented = true
 			mimeType = "video/mp4"
@@ -302,12 +300,16 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		codecString, videoWidth, videoHeight, videoDuration = probeVideoInfo(filePath)
 	}
 
+	// Always generate a hash nonce so the server cannot distinguish
+	// modified from unmodified files by presence/absence of the field.
+	hashNonce, err := crypto.GenerateHashNonce()
+	if err != nil {
+		return fmt.Errorf("generate hash nonce: %w", err)
+	}
 	// Hash modification — skip for fMP4 remuxed videos (would break container)
-	var hashNonce []byte
 	if !fragmented {
-		tmpHash, nonce, err := modifyHashToFile(srcPath, mimeType)
-		if err == nil {
-			tmpCleanup = append(tmpCleanup, tmpHash)
+		tmpHash, nonce, hashErr := modifyHashToFile(srcPath, mimeType, tmpDir)
+		if hashErr == nil {
 			srcPath = tmpHash
 			hashNonce = nonce
 		}
@@ -318,7 +320,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if mediaType == "video" {
 		thumbWg.Wait()
 	} else {
-		thumbData = generateThumbnail(filePath)
+		thumbData = generateThumbnail(filePath, tmpDir)
 	}
 
 	// Get file size from source
@@ -402,6 +404,9 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if err != nil {
 		return err
 	}
+	// Pad metadata to a power-of-2 bucket (min 512 bytes) so the encrypted
+	// blob size does not reveal filename length or metadata field presence.
+	metadataPlain = padToBucket(metadataPlain, 512)
 	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
@@ -417,9 +422,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 		"metadata_enc":   base64.StdEncoding.EncodeToString(metadataCiphertext),
 		"metadata_nonce": base64.StdEncoding.EncodeToString(metadataNonce),
 	}
-	if len(hashNonce) > 0 {
-		uploadMeta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
-	}
+	uploadMeta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
 
 	// Stream the multipart body via io.Pipe. Each segment is read from the
 	// source file, encrypted, and written directly to the pipe — only one
@@ -520,14 +523,14 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 
 // remuxToFMP4File remuxes the video at filePath to fragmented MP4 using ffmpeg.
 // Returns the temp file path and true on success. Caller must remove the temp file.
-func remuxToFMP4File(filePath string) (string, bool) {
+func remuxToFMP4File(filePath, tmpDir string) (string, bool) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n    (ffmpeg not found — skipping fMP4 remux)\n    ")
 		return "", false
 	}
 
-	tmpFile, err := os.CreateTemp("", "drk-fmp4-*.mp4")
+	tmpFile, err := os.CreateTemp(tmpDir, "*.mp4")
 	if err != nil {
 		return "", false
 	}
@@ -725,9 +728,9 @@ func mapAudioCodec(codec string) string {
 	}
 }
 
-func generateThumbnail(filePath string) []byte {
+func generateThumbnail(filePath, tmpDir string) []byte {
 	if isVideo(strings.ToLower(filepath.Ext(filePath))) {
-		return generateVideoThumbnail(filePath)
+		return generateVideoThumbnail(filePath, tmpDir)
 	}
 	return generateImageThumbnailFromFile(filePath)
 }
@@ -770,14 +773,14 @@ func generateImageThumbnailFromFile(filePath string) []byte {
 	return buf.Bytes()
 }
 
-func generateVideoThumbnail(filePath string) []byte {
+func generateVideoThumbnail(filePath, tmpDir string) []byte {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n    (ffmpeg not found — using placeholder thumbnail for video)\n    ")
 		return placeholderThumb()
 	}
 
-	tmpFile, err := os.CreateTemp("", "drk-thumb-*.jpg")
+	tmpFile, err := os.CreateTemp(tmpDir, "*.jpg")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n    (failed to create temp file — using placeholder thumbnail)\n    ")
 		return placeholderThumb()
@@ -823,7 +826,7 @@ func placeholderThumb() []byte {
 // to compute the insertion point and blob, then writes [prefix][blob][rest] to
 // a temp file. Returns the temp file path (caller must remove) and the nonce.
 // Returns ("", nil, nil) if hash modification is not supported for the format.
-func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, err error) {
+func modifyHashToFile(srcPath, mimeType, tmpDir string) (tmpPath string, nonce []byte, err error) {
 	lower := strings.ToLower(mimeType)
 
 	// Read a small header to determine the insertion point
@@ -879,7 +882,7 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 			pos = int(next)
 		}
 		insertPos = pos
-		keyword := "darkreel"
+		keyword := "Comment"
 		textData := append([]byte(keyword), 0)
 		textData = append(textData, nonce...)
 		blob = crypto.BuildPNGChunkExported("tEXt", textData)
@@ -899,7 +902,7 @@ func modifyHashToFile(srcPath, mimeType string) (tmpPath string, nonce []byte, e
 	}
 
 	// Write to temp file: [prefix][blob][rest streamed from original]
-	tmp, err := os.CreateTemp("", "drk-hashmod-*")
+	tmp, err := os.CreateTemp(tmpDir, "*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -961,6 +964,25 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// padToBucket pads data with spaces to the nearest power-of-2 bucket
+// (minimum minSize). JSON parsers ignore trailing whitespace, so the
+// padded data can be decrypted and unmarshalled without stripping.
+func padToBucket(data []byte, minSize int) []byte {
+	target := minSize
+	for target < len(data) {
+		target *= 2
+	}
+	if len(data) == target {
+		return data
+	}
+	padded := make([]byte, target)
+	copy(padded, data)
+	for i := len(data); i < target; i++ {
+		padded[i] = ' '
+	}
+	return padded
 }
 
 // buildAuthJSON constructs a JSON body like {"username":"...","password":"..."}
