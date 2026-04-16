@@ -1081,10 +1081,12 @@ func requireHTTPS(serverURL string, insecure bool) {
 	if !strings.HasPrefix(serverURL, "http://") {
 		return // HTTPS or other — already validated by validateServerURL
 	}
-	if strings.HasPrefix(serverURL, "http://localhost") ||
-		strings.HasPrefix(serverURL, "http://127.0.0.1") ||
-		strings.HasPrefix(serverURL, "http://[::1]") {
-		return // localhost is exempt
+	u, err := url.Parse(serverURL)
+	if err == nil {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return // localhost is exempt
+		}
 	}
 	if insecure {
 		fmt.Fprintln(os.Stderr, "WARNING: Using plaintext HTTP. Credentials and encryption keys will be sent unencrypted.")
