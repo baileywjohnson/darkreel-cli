@@ -208,12 +208,18 @@ func cmdUpload() {
 	}
 	defer zeroBytes(masterKey)
 
+	// Copy token into a []byte so it can be wiped from memory after the last
+	// API call. Release the string reference so GC can reclaim the original.
+	token := []byte(loginResp.Token)
+	loginResp.Token = ""
+	defer zeroBytes(token)
+
 	fmt.Fprintf(os.Stderr, "Authenticated. Uploading %d file(s)...\n\n", len(files))
 
 	success, fail := 0, 0
 	for _, f := range files {
 		fmt.Fprintf(os.Stderr, "  file %d/%d ", success+fail+1, len(files))
-		if err := uploadFile(uploadClient, serverURL, loginResp.Token, masterKey, f); err != nil {
+		if err := uploadFile(uploadClient, serverURL, token, masterKey, f); err != nil {
 			// Error details intentionally omitted — server responses may contain
 			// information useful for fingerprinting or probing the API.
 			fmt.Fprintf(os.Stderr, "FAILED\n")
@@ -245,7 +251,7 @@ func decryptMasterKey(encB64 string, password []byte, kdfSaltB64, userID string)
 	return crypto.DecryptBlock(encData, sessionKey, []byte(userID))
 }
 
-func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, filePath string) error {
+func uploadFile(client *http.Client, serverURL string, token []byte, masterKey []byte, filePath string) error {
 	// Resolve to absolute path so filenames starting with "-" aren't
 	// interpreted as flags by ffmpeg/ffprobe.
 	absPath, err := filepath.Abs(filePath)
@@ -407,6 +413,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	// Pad metadata to a power-of-2 bucket (min 512 bytes) so the encrypted
 	// blob size does not reveal filename length or metadata field presence.
 	metadataPlain = padToBucket(metadataPlain, 512)
+	defer zeroBytes(metadataPlain) // wipe filename and other metadata from memory
 	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey, mediaIDBytes)
 	if err != nil {
 		return err
@@ -471,6 +478,15 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 			return
 		}
 		buf := make([]byte, 0, chunkSize+chunkSize/2) // reusable read buffer
+		defer func() {
+			// Wipe plaintext from the read buffer (last chunk's content lingers otherwise)
+			if cap(buf) > 0 {
+				b := buf[:cap(buf)]
+				for i := range b {
+					b[i] = 0
+				}
+			}
+		}()
 		for i, seg := range segments {
 			if cap(buf) < int(seg.length) {
 				buf = make([]byte, seg.length)
@@ -501,7 +517,7 @@ func uploadFile(client *http.Client, serverURL, token string, masterKey []byte, 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := client.Do(req)
@@ -1112,9 +1128,10 @@ func validateServerURL(serverURL string) {
 	}
 }
 
-// login authenticates and returns (token, masterKey). Caller must zeroBytes(masterKey).
-// Zeroes the password in cf after use.
-func login(cf connFlags) (string, []byte) {
+// login authenticates and returns (token, masterKey). Caller must zeroBytes both.
+// Zeroes the password in cf after use. Token is returned as []byte (not string)
+// so the caller can wipe it from memory after the last API call.
+func login(cf connFlags) ([]byte, []byte) {
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	jsonBody := buildAuthJSON(cf.username, cf.password)
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
@@ -1138,7 +1155,9 @@ func login(cf connFlags) (string, []byte) {
 	if err != nil {
 		fatal("failed to decrypt master key: %v", err)
 	}
-	return lr.Token, masterKey
+	token := []byte(lr.Token)
+	lr.Token = "" // release the string reference so GC can reclaim the original
+	return token, masterKey
 }
 
 // sanitizeServerResponse strips non-printable characters and truncates for safe display.
@@ -1204,14 +1223,14 @@ func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error
 	return &meta, nil
 }
 
-func fetchAllMedia(serverURL, token string) ([]apiMediaItem, error) {
+func fetchAllMedia(serverURL string, token []byte) ([]apiMediaItem, error) {
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var all []apiMediaItem
 	page := 1
 	const maxPages = 1000
 	for page <= maxPages {
 		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/media?page=%d&limit=200", serverURL, page), nil)
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Authorization", "Bearer "+string(token))
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
@@ -1246,6 +1265,7 @@ func cmdList() {
 	cf, _ := parseConnFlags(os.Args[2:])
 	token, masterKey := login(cf)
 	defer zeroBytes(masterKey)
+	defer zeroBytes(token)
 
 	items, err := fetchAllMedia(cf.serverURL, token)
 	if err != nil {
@@ -1305,6 +1325,7 @@ func cmdDownload() {
 
 	token, masterKey := login(cf)
 	defer zeroBytes(masterKey)
+	defer zeroBytes(token)
 
 	items, err := fetchAllMedia(cf.serverURL, token)
 	if err != nil {
@@ -1379,6 +1400,12 @@ func cmdDownload() {
 		if safeName == "." || safeName == ".." || safeName == "" {
 			safeName = item.ID // fallback to media ID
 		}
+		// Reject dotfiles — a crafted server could set meta.Name to ".bashrc"
+		// or similar, which filepath.Base would pass through unchanged, overwriting
+		// shell configs if the user downloads to their home directory.
+		if strings.HasPrefix(safeName, ".") {
+			safeName = item.ID + "_" + strings.TrimLeft(safeName, ".")
+		}
 		outPath := filepath.Join(outDir, safeName)
 		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
@@ -1434,7 +1461,7 @@ func cmdDownload() {
 				defer func() { <-sem }()
 				res := chunkResult{index: ci}
 				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/media/%s/chunk/%d", cf.serverURL, item.ID, ci), nil)
-				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("Authorization", "Bearer "+string(token))
 				resp, err := client.Do(req)
 				if err != nil {
 					res.err = err
@@ -1497,9 +1524,11 @@ func cmdDownload() {
 				break
 			}
 			if _, err := outFile.Write(res.data); err != nil {
+				zeroBytes(res.data)
 				ok = false
 				break
 			}
+			zeroBytes(res.data) // wipe decrypted plaintext from memory
 			if nextLaunch < meta.ChunkCount {
 				fetchChunk(nextLaunch)
 				nextLaunch++
