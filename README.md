@@ -202,8 +202,10 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **Password cleared from environment** — `os.Unsetenv("DRK_PASS")` called immediately after reading, invisible to child processes and `/proc/pid/environ`
 - **Password zeroed in memory** — stored as `[]byte` (not Go `string`) and zeroed after master key derivation. Auth JSON bodies are constructed directly from `[]byte` without converting the password to an immutable Go `string`, preventing un-zeroable copies from lingering on the heap
 - **File keys zeroed** — all per-file encryption keys are zeroed after use via `defer`
+- **JWT tokens zeroed** — auth tokens are stored as `[]byte` (not Go `string`) and passed through the upload/list/download call stack as byte slices. The token is zeroed after the last API call, and the original JSON-decoded string field is released so the GC can reclaim it
+- **Plaintext buffers zeroed** — decrypted chunk plaintext is zeroed immediately after being written to disk during download. Upload-side read buffers are zeroed when the upload goroutine exits. Encrypted metadata's plaintext (containing the original filename and file info) is zeroed after encryption
 - **Server responses sanitized** — error bodies stripped of non-printable characters (ANSI escapes, control codes) before display, truncated to 512 chars
-- **Path traversal protection** — downloaded filenames sanitized via `filepath.Base()` to prevent writes outside the output directory
+- **Path traversal protection** — downloaded filenames sanitized via `filepath.Base()` to prevent writes outside the output directory. Dotfile names (e.g., `.bashrc`) are prefixed with the media ID to prevent overwriting shell configs when downloading to a home directory
 - **Restrictive file permissions** — downloaded files created with `0600` (owner read/write only)
 - **No shell execution** — all subprocesses (ffmpeg, ffprobe) spawned via `exec.Command` with argument arrays, never through a shell
 - **Absolute paths for subprocesses** — file paths resolved to absolute before passing to ffmpeg/ffprobe, preventing `-` prefix filenames from being interpreted as flags
