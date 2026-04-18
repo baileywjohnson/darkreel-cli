@@ -185,6 +185,19 @@ Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification
 
 Video thumbnails and fMP4 remuxing require ffmpeg. If ffmpeg is not available, a 1x1 placeholder thumbnail is used and videos are uploaded without remuxing (no streaming playback, full download required).
 
+## Development
+
+```bash
+# Run the test suite (crypto round-trips, AAD binding, hash modification,
+# padding buckets, filename sanitization, server response sanitization)
+go test ./...
+
+# With verbose output
+go test -v ./...
+```
+
+The crypto tests verify compatibility with the Darkreel server's protocol — changes to AAD construction, key wrapping, or hash modification that diverge from the server's scheme will be caught here.
+
 ## Releasing
 
 Binaries are automatically built and published when a version tag is pushed:

@@ -2,3 +2,16 @@ drk
 darkreel-cli
 *.exe
 .DS_Store
+
+# Credential files (defensive — CLI reads DRK_PASS/DRK_SERVER/DRK_USER
+# from the environment, but users often manage those via local .env files)
+.env
+.env.*
+
+# Keys & certs (defensive)
+*.key
+*.pem
+*.p12
+*.pfx
+*.cert
+*.crt
