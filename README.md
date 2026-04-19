@@ -212,7 +212,7 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 ## Security
 
 - **Password never on CLI** — accepted only via `DRK_PASS` environment variable (invisible to `ps aux` / `/proc/pid/cmdline`)
-- **Password cleared from environment** — `os.Unsetenv("DRK_PASS")` called immediately after reading, invisible to child processes and `/proc/pid/environ`
+- **Password cleared from environment for child processes** — `os.Unsetenv("DRK_PASS")` runs immediately after reading, so any subprocess the CLI spawns (ffmpeg, ffprobe) does not inherit it. **Caveat:** on Linux, `os.Unsetenv` only modifies the Go runtime's environment map; the kernel-visible `/proc/<pid>/environ` still contains the original value for the lifetime of the process. On shared hosts where other same-UID processes can read `/proc/<pid>/environ` (multi-tenant servers, compromised sidecars), `DRK_PASS` should be considered recoverable while the CLI is running. For hardened deployments, pass the password via a dedicated secret manager or run the CLI on a dedicated host/container
 - **Password zeroed in memory** — stored as `[]byte` (not Go `string`) and zeroed after master key derivation. Auth JSON bodies are constructed directly from `[]byte` without converting the password to an immutable Go `string`, preventing un-zeroable copies from lingering on the heap
 - **File keys zeroed** — all per-file encryption keys are zeroed after use via `defer`
 - **JWT tokens zeroed** — auth tokens are stored as `[]byte` (not Go `string`) and passed through the upload/list/download call stack as byte slices. The token is zeroed after the last API call, and the original JSON-decoded string field is released so the GC can reclaim it

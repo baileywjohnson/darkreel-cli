@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -33,6 +34,38 @@ import (
 
 const chunkSize = 1 << 20       // 1 MB — used for non-fragmented files only
 const subprocessTimeout = 10 * time.Minute // ffmpeg/ffprobe timeout
+const maxMetadataBytes = 1 << 20 // 1 MB — hard cap on encrypted metadata size
+
+// newHTTPTransport returns a transport with an explicit TLS minimum version so
+// a refactor can't silently weaken the default or enable InsecureSkipVerify.
+func newHTTPTransport() *http.Transport {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+}
+
+// limitWriter wraps an io.Writer and silently discards bytes past limit.
+// Used to cap subprocess stdout so a pathological child cannot exhaust memory.
+type limitWriter struct {
+	w       io.Writer
+	limit   int
+	written int
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if l.written >= l.limit {
+		return len(p), nil // pretend to accept; discard
+	}
+	remaining := l.limit - l.written
+	if len(p) <= remaining {
+		n, err := l.w.Write(p)
+		l.written += n
+		return n, err
+	}
+	n, err := l.w.Write(p[:remaining])
+	l.written += n
+	return len(p), err // report full len so the child doesn't see short writes
+}
 
 // segment describes a byte range in a source file.
 type segment struct {
@@ -159,8 +192,8 @@ func cmdUpload() {
 	noRedirect := func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	authClient := &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirect}
-	uploadClient := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: noRedirect}
+	authClient := &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirect, Transport: newHTTPTransport()}
+	uploadClient := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: noRedirect, Transport: newHTTPTransport()}
 
 	// Register if requested
 	if register {
@@ -671,13 +704,17 @@ func probeVideoInfo(filePath string) (string, int, int, float64) {
 		"-of", "json",
 		filePath,
 	)
-	out, err := cmd.Output()
-	if err != nil {
+	// Cap ffprobe stdout at 1 MB — real JSON output is <10 KB. A crafted input
+	// could cause ffprobe to emit unbounded output; we treat that as a probe
+	// failure and fall back to defaults.
+	var out bytes.Buffer
+	cmd.Stdout = &limitWriter{w: &out, limit: 1 << 20}
+	if err := cmd.Run(); err != nil {
 		return "avc1.64001f,mp4a.40.2", 0, 0, 0
 	}
 
 	var result ffprobeResult
-	if err := json.Unmarshal(out, &result); err != nil {
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		return "avc1.64001f,mp4a.40.2", 0, 0, 0
 	}
 
@@ -1132,7 +1169,7 @@ func validateServerURL(serverURL string) {
 // Zeroes the password in cf after use. Token is returned as []byte (not string)
 // so the caller can wipe it from memory after the last API call.
 func login(cf connFlags) ([]byte, []byte) {
-	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: newHTTPTransport()}
 	jsonBody := buildAuthJSON(cf.username, cf.password)
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
 	zeroBytes(jsonBody)
@@ -1198,6 +1235,12 @@ type mediaMetadata struct {
 }
 
 func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error) {
+	// Hard cap on metadata size. Real metadata is <1 KB (filename, mime, dims,
+	// duration); anything beyond this is a hostile/compromised server trying to
+	// exhaust client memory before AES-GCM authentication fails.
+	if len(item.MetadataEnc) > maxMetadataBytes {
+		return nil, fmt.Errorf("metadata too large: %d bytes", len(item.MetadataEnc))
+	}
 	encData, err := base64.StdEncoding.DecodeString(item.MetadataEnc)
 	if err != nil {
 		return nil, err
@@ -1224,7 +1267,7 @@ func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error
 }
 
 func fetchAllMedia(serverURL string, token []byte) ([]apiMediaItem, error) {
-	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: newHTTPTransport()}
 	var all []apiMediaItem
 	page := 1
 	const maxPages = 1000
@@ -1364,7 +1407,10 @@ func cmdDownload() {
 	client := &http.Client{
 		Timeout:       10 * time.Minute,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Transport:     &http.Transport{MaxIdleConnsPerHost: 4}, // match dlWorkers to reuse connections
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 4, // match dlWorkers to reuse connections
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		},
 	}
 	success, fail := 0, 0
 
@@ -1454,24 +1500,40 @@ func cmdDownload() {
 		sem := make(chan struct{}, dlWorkers)
 		nextLaunch := 0
 
+		// Per-item cancellation + WaitGroup so the deferred token-zero at the
+		// end of cmdDownload never runs while goroutines still hold a token
+		// reference. On early error break below, cancel() unblocks any pending
+		// sends on the result channels and fetchWg.Wait() ensures every fetch
+		// goroutine has released its reference before we move on.
+		fetchCtx, fetchCancel := context.WithCancel(context.Background())
+		var fetchWg sync.WaitGroup
+
 		fetchChunk := func(ci int) {
 			slot := ci % windowSize
 			sem <- struct{}{}
+			fetchWg.Add(1)
 			go func() {
+				defer fetchWg.Done()
 				defer func() { <-sem }()
 				res := chunkResult{index: ci}
-				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/media/%s/chunk/%d", cf.serverURL, item.ID, ci), nil)
+				send := func(r chunkResult) {
+					select {
+					case window[slot] <- r:
+					case <-fetchCtx.Done():
+					}
+				}
+				req, _ := http.NewRequestWithContext(fetchCtx, "GET", fmt.Sprintf("%s/api/media/%s/chunk/%d", cf.serverURL, item.ID, ci), nil)
 				req.Header.Set("Authorization", "Bearer "+string(token))
 				resp, err := client.Do(req)
 				if err != nil {
 					res.err = err
-					window[slot] <- res
+					send(res)
 					return
 				}
 				if resp.StatusCode != 200 {
 					resp.Body.Close()
 					res.err = fmt.Errorf("status %d", resp.StatusCode)
-					window[slot] <- res
+					send(res)
 					return
 				}
 				// Read length prefix, then only the real data (skip padding)
@@ -1479,21 +1541,21 @@ func cmdDownload() {
 				if _, err := io.ReadFull(resp.Body, lenBuf[:]); err != nil {
 					resp.Body.Close()
 					res.err = fmt.Errorf("read length prefix: %w", err)
-					window[slot] <- res
+					send(res)
 					return
 				}
 				realLen := binary.BigEndian.Uint32(lenBuf[:])
 				if realLen > 20<<20 {
 					resp.Body.Close()
 					res.err = fmt.Errorf("chunk too large: %d", realLen)
-					window[slot] <- res
+					send(res)
 					return
 				}
 				encrypted := make([]byte, realLen)
 				if _, err := io.ReadFull(resp.Body, encrypted); err != nil {
 					resp.Body.Close()
 					res.err = fmt.Errorf("read chunk data: %w", err)
-					window[slot] <- res
+					send(res)
 					return
 				}
 				io.Copy(io.Discard, io.LimitReader(resp.Body, 20<<20)) // drain padding
@@ -1501,11 +1563,11 @@ func cmdDownload() {
 				plaintext, err := crypto.DecryptChunkWith(gcm, encrypted, ci, item.ID)
 				if err != nil {
 					res.err = err
-					window[slot] <- res
+					send(res)
 					return
 				}
 				res.data = plaintext
-				window[slot] <- res
+				send(res)
 			}()
 		}
 
@@ -1534,6 +1596,11 @@ func cmdDownload() {
 				nextLaunch++
 			}
 		}
+		// Cancel any in-flight fetches (their sends unblock via fetchCtx.Done)
+		// and wait for them to return before we touch token/masterKey on the
+		// next iteration or via the deferred zeroBytes at function exit.
+		fetchCancel()
+		fetchWg.Wait()
 		outFile.Close()
 		zeroBytes(fileKey)
 
