@@ -2,6 +2,17 @@
 
 Command-line client for [Darkreel](https://github.com/baileywjohnson/darkreel) — upload, list, and download encrypted media. All encryption and decryption happens locally. The server never sees your plaintext files.
 
+> ## ⚠ Server compatibility
+>
+> **This CLI targets Darkreel schema v1** (pre-delegation, pre-sealed-box uploads). Releases up to and including **v0.2.5** speak the legacy `file_key_enc` / `thumb_key_enc` / master-key-wrapped metadata wire format.
+>
+> Darkreel schema v2 (released alongside delegated-upload support) rejects this wire format with `sealed key has wrong length`. Until a v0.3.x release ships with v2 support, options for v2 Darkreel servers are:
+>
+> - **Browser uploads** via Darkreel's web UI — full feature parity including fMP4 streaming.
+> - **Delegated uploads** via [PPVDA](https://github.com/baileywjohnson/ppvda) — Connect your Darkreel account once and PPVDA handles the sealed-box upload natively.
+>
+> v0.3.x will add a `drk connect` subcommand that performs the same copy-paste authorization flow as PPVDA and switches upload/list/download to the sealed-box protocol. Track progress in the repo's release notes.
+
 ## Features
 
 - **Upload** -- Encrypt and upload files with AES-256-GCM chunk encryption matching Darkreel's protocol
