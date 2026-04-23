@@ -11,19 +11,19 @@ Command-line client for [Darkreel](https://github.com/baileywjohnson/darkreel) �
 
 ## Features
 
-- **Upload** -- Encrypt and upload files with AES-256-GCM chunk encryption matching Darkreel's protocol
-- **List** -- List all media items with decrypted filenames, types, and sizes
-- **Download** -- Download and decrypt media items (parallel chunk fetching, 4 workers)
+- **Upload** -- Encrypt and upload files with Darkreel's schema v2 wire format: per-file `fileKey` / `thumbKey` / `metadataKey` generated locally, sealed to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM), chunks AEAD-encrypted under `fileKey` with media ID + chunk index as AAD
+- **List** -- List all media items with decrypted filenames, types, and sizes (opens sealed metadata keys with the account private key)
+- **Download** -- Download and decrypt media items (parallel chunk fetching, 4 workers, sealed-key opening)
 - **Streaming uploads** -- Chunks are read from disk, encrypted, and streamed to the server one at a time. Only one chunk (~1 MB) is in memory at any time, regardless of file size
 - **Thumbnail generation** -- Automatic thumbnails for images (native) and videos (requires ffmpeg)
 - **Hash modification** -- Random metadata injected into file headers before encryption, streaming from disk (only reads a small header, not the full file)
 - **Batch operations** -- Upload or download multiple files in a single command
 - **Account registration** -- Create accounts via CLI with `-register`
-- **Credential hygiene** -- Password accepted only via `DRK_PASS` env var (never a CLI flag), cleared from process environment immediately after reading, zeroed in memory after use
+- **Credential hygiene** -- Password accepted via `DRK_PASS` env var or `-pw-stdin` flag (never as a CLI flag value). `-pw-stdin` (v0.3.1+) is preferred in scripts — stdin bytes never enter the process environment, so they're not observable via `/proc/<pid>/environ`. `DRK_PASS` is cleared from the process environment immediately after reading and zeroed in memory after master-key derivation
 
 ## Minimum requirements
 
-- Go 1.22+ (to build from source)
+- Go 1.26.2+ (to build from source — pinned for stdlib CVE coverage)
 - ffmpeg (optional, for video thumbnails and fMP4 remuxing — placeholders used if unavailable)
 - ffprobe (optional, for video codec detection — defaults used if unavailable)
 
@@ -82,6 +82,7 @@ darkreel-cli download [flags] [-o DIR] [ID...]
 | `-server` | Darkreel server URL (e.g., `https://media.example.com`) |
 | `-user` | Username |
 | `-insecure` | Allow plaintext HTTP for non-localhost URLs (blocked by default) |
+| `-pw-stdin` | Read password from stdin (one line, trailing CR/LF stripped). Preferred over `DRK_PASS` in scripts — stdin bytes never enter the process environment, closing the `/proc/<pid>/environ` window the env var briefly exposes. Available in v0.3.1+ |
 
 ### Upload flags
 
@@ -99,20 +100,20 @@ If no IDs are specified, all items are downloaded. Downloaded files are created 
 
 ### Environment variables
 
-Credentials can be passed via environment variables instead of CLI flags. This is recommended for automation and prevents credentials from appearing in shell history or `ps aux`:
+Non-password credentials can be passed via env vars instead of CLI flags — useful for automation and keeps them out of shell history / `ps aux`:
 
 | Variable | Description |
 |----------|-------------|
 | `DRK_SERVER` | Darkreel server URL |
 | `DRK_USER` | Username |
-| `DRK_PASS` | Password (**required**, env var only — never accepted as a CLI flag) |
+| `DRK_PASS` | Password. Cleared from the process environment immediately after reading. **In scripted deployments, prefer `-pw-stdin`** — `DRK_PASS` is briefly visible in `/proc/<pid>/environ` between exec and unset, while stdin bytes never enter the environment at all. |
 
-The password must be set via `DRK_PASS`. It is cleared from the process environment immediately after reading. Server URL and username can also be set via `-server` and `-user` flags, which take precedence over their env var equivalents.
+Server URL and username can also be set via `-server` and `-user` flags, which take precedence over their env var equivalents. The password must come from exactly one of `DRK_PASS` or `-pw-stdin`.
 
 ## Examples
 
 ```bash
-# Set credentials (recommended)
+# Set credentials (interactive use)
 export DRK_SERVER=https://media.example.com
 export DRK_USER=alice
 export DRK_PASS=secret
@@ -122,6 +123,14 @@ darkreel-cli upload photo.jpg video.mp4
 
 # Upload all images in a directory
 darkreel-cli upload ~/Photos/*.jpg
+
+# Scripted upload with password from a secret file (no env var exposure)
+cat ~/.secrets/drk-pw | darkreel-cli upload -pw-stdin \
+  -server https://media.example.com -user alice vacation.mp4
+
+# Scripted upload with password from a secret manager
+vault kv get -field=pw secret/drk | darkreel-cli upload -pw-stdin \
+  -server https://media.example.com -user alice vacation.mp4
 
 # Register a new account and upload
 DRK_PASS=mypassword darkreel-cli upload -server https://media.example.com -user newuser -register vacation.mp4
@@ -145,30 +154,32 @@ DRK_PASS=secret darkreel-cli upload -server https://media.example.com -user alic
 
 1. Authenticates with the Darkreel server (registers first if `-register` is set)
 2. Receives the master key encrypted with a PBKDF2-derived session key, decrypts it client-side
-3. For each file:
+3. Unwraps the account's X25519 private key (AES-256-GCM-encrypted under the master key with user ID as AAD) — needed to open sealed keys during download/list, and carried alongside the master key for the life of the session
+4. For each file:
    - **Videos:** Remuxes to fragmented MP4 via ffmpeg (`-c copy`, no re-encoding, written to temp file)
    - **Hash modification:** Reads a small header (64 KB) from disk to determine the insertion point, streams the modified file to a temp file — the full file is never loaded into memory
    - Generates a 320px JPEG thumbnail from the file path (images: native decode, videos: ffmpeg)
-   - Generates random 256-bit encryption keys for file and thumbnail
-   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) into a single blob with the master key. Metadata is padded to a power-of-2 bucket (minimum 512 bytes) before encryption, preventing blob size from leaking filename length or field presence
+   - Generates three per-file random 256-bit keys — `fileKey`, `thumbKey`, `metadataKey` — and seals each to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM, 92 bytes per sealed key). This matches Darkreel's schema v2 sealed-box protocol, bytes-identical to what the web SPA and PPVDA produce.
+   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) under the dedicated `metadataKey` (not the master key) — keeps metadata-rotation / rename scope-limited to a delegated client that only holds metadata access. Padded to a power-of-2 bucket (minimum 512 bytes) before encryption, preventing blob size from leaking filename length or field presence
    - Computes segment boundaries — videos at fMP4 moof boundaries (scanned from file headers), other files at 1 MB
-   - Streams the multipart upload via `io.Pipe`: each segment is read from disk, encrypted with AES-256-GCM (media ID + chunk index as AAD), and written directly to the HTTP request — only one chunk is in memory at a time
+   - Streams the multipart upload via `io.Pipe`: each segment is read from disk, encrypted with AES-256-GCM under `fileKey` (media ID + chunk index as AAD), and written directly to the HTTP request — only one chunk is in memory at a time
 
-The server only ever receives encrypted data and an encrypted metadata blob. File names, types, sizes, dimensions, and codecs are never visible to the server.
+The server only ever receives ciphertext blobs and three sealed keys. File names, types, sizes, dimensions, codecs, and all symmetric key material remain opaque to the server.
 
 Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadata, enabling instant streaming playback in the Darkreel web UI via MediaSource Extensions.
 
 ### Download pipeline
 
-1. Authenticates and fetches the media list
-2. Decrypts metadata blobs to get filenames, chunk counts, and file keys
-3. For each item, fetches chunks in parallel (4 workers, connection-pooled) via the padded chunk endpoint
-4. Each chunk: strips server-side padding → decrypts with AES-256-GCM → writes to disk in order
+1. Authenticates, unwraps the X25519 private key, fetches the media list
+2. For each item: opens the sealed `metadataKey` with the private key and decrypts the metadata blob to get the filename, chunk count, etc.; opens the sealed `fileKey` the same way for chunk decryption
+3. Fetches chunks in parallel (4 workers, connection-pooled) via the padded chunk endpoint
+4. Each chunk: strips server-side padding → decrypts with AES-256-GCM under `fileKey` → writes to disk in order
 5. Downloaded filenames are sanitized (`filepath.Base`) to prevent path traversal
+6. Per-item total-bytes cap of 50 GB guards against a compromised server padding `chunk_count` × 20 MB per chunk into a TB-scale download
 
 ### List
 
-Fetches all media items (paginated), decrypts each metadata blob, and prints a table with ID, type, size, and filename.
+Fetches all media items (paginated), opens each sealed `metadataKey` with the private key, decrypts the metadata blob, and prints a table with ID, type, size, and filename.
 
 ## Hash modification
 
@@ -218,8 +229,10 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 
 ## Security
 
-- **Password never on CLI** — accepted only via `DRK_PASS` environment variable (invisible to `ps aux` / `/proc/pid/cmdline`)
-- **Password cleared from environment for child processes** — `os.Unsetenv("DRK_PASS")` runs immediately after reading, so any subprocess the CLI spawns (ffmpeg, ffprobe) does not inherit it. **Caveat:** on Linux, `os.Unsetenv` only modifies the Go runtime's environment map; the kernel-visible `/proc/<pid>/environ` still contains the original value for the lifetime of the process. On shared hosts where other same-UID processes can read `/proc/<pid>/environ` (multi-tenant servers, compromised sidecars), `DRK_PASS` should be considered recoverable while the CLI is running. For hardened deployments, pass the password via a dedicated secret manager or run the CLI on a dedicated host/container
+- **Password never on CLI argv** — never accepted as a flag value (invisible to `ps aux` / `/proc/<pid>/cmdline`)
+- **Two password input paths:**
+  - **`-pw-stdin` (preferred for scripts, v0.3.1+)** — stdin bytes never enter the process environment, so they're not observable via `/proc/<pid>/environ` at any point. Closes the exec-time leak window that the env var path inherently has
+  - **`DRK_PASS` env var** — read and cleared via `os.Unsetenv("DRK_PASS")` immediately after reading so any subprocess the CLI spawns (ffmpeg, ffprobe) does not inherit it. **Caveat:** on Linux, `os.Unsetenv` only modifies the Go runtime's environment map; the kernel-visible `/proc/<pid>/environ` still contains the original value briefly between exec and the unset call — and potentially longer depending on how the runtime reconciles the two. Prefer `-pw-stdin` on shared hosts or anywhere else other same-UID processes could observe `/proc/<pid>/environ`
 - **Password zeroed in memory** — stored as `[]byte` (not Go `string`) and zeroed after master key derivation. Auth JSON bodies are constructed directly from `[]byte` without converting the password to an immutable Go `string`, preventing un-zeroable copies from lingering on the heap
 - **File keys zeroed** — all per-file encryption keys are zeroed after use via `defer`
 - **JWT tokens zeroed** — auth tokens are stored as `[]byte` (not Go `string`) and passed through the upload/list/download call stack as byte slices. The token is zeroed after the last API call, and the original JSON-decoded string field is released so the GC can reclaim it
@@ -230,6 +243,8 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **No shell execution** — all subprocesses (ffmpeg, ffprobe) spawned via `exec.Command` with argument arrays, never through a shell
 - **Absolute paths for subprocesses** — file paths resolved to absolute before passing to ffmpeg/ffprobe, preventing `-` prefix filenames from being interpreted as flags
 - **Chunk download limits** — response bodies capped at 20 MB per chunk, and server-side padding drained with a 20 MB cap, to prevent memory exhaustion from a malicious server
+- **Per-item download size cap** — total decrypted bytes per item are capped at 50 GB, preventing a compromised server from combining the 20 MB per-chunk × 50k chunk-count ceilings into a TB-scale bandwidth/disk attack
+- **fMP4 scanner bounds checking** — 64-bit `largesize` box headers that don't fit in int64 are rejected (prevents pathological files driving the box walk into an infinite backward loop); accumulated moof-offset slice growth is capped at 100 k entries
 - **Response body limits** — login responses capped at 1 MB, media list responses at 5 MB, preventing memory exhaustion from a malicious server on success paths
 - **HTTPS enforced by default** — plaintext HTTP is blocked for non-localhost URLs unless `-insecure` is explicitly passed. Localhost (`127.0.0.1`, `::1`, `localhost`) is exempt. Prevents accidental credential transmission in the clear
 - **URL scheme validation** — server URLs are validated to use only `http://` or `https://` schemes, rejecting `file://`, `ftp://`, and other exotic schemes that could be used to exfiltrate credentials
