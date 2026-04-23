@@ -14,6 +14,7 @@ import (
 	_ "image/gif"
 	_ "image/png"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -78,6 +79,31 @@ type loginResponse struct {
 	KDFSalt            string `json:"kdf_salt"`
 	UserID             string `json:"user_id"`
 	EncryptedMasterKey string `json:"encrypted_master_key"`
+	// Shape-2 additions. PublicKey is the user's X25519 public key (32 bytes),
+	// needed to seal per-file keys during upload. EncryptedPrivKey is the
+	// matching private key encrypted with AES-256-GCM under the master key,
+	// with userID as AAD — CLI unwraps it after decrypting the master key.
+	PublicKey        string `json:"public_key"`
+	EncryptedPrivKey string `json:"encrypted_priv_key"`
+}
+
+// userSession holds the credentials derived from a successful login. All byte
+// slices are sensitive and must be zeroed before the process exits; callers
+// use sess.zero() in a defer immediately after login.
+type userSession struct {
+	token     []byte
+	masterKey []byte
+	publicKey []byte
+	privKey   []byte
+	userID    string
+}
+
+func (s *userSession) zero() {
+	zeroBytes(s.token)
+	zeroBytes(s.masterKey)
+	// publicKey is public, no need to wipe, but cheap and consistent
+	zeroBytes(s.publicKey)
+	zeroBytes(s.privKey)
 }
 
 func main() {
@@ -215,44 +241,16 @@ func cmdUpload() {
 
 	// Login
 	fmt.Printf("Logging in as %q...\n", username)
-	loginBody := buildAuthJSON(username, password)
-	resp, err := authClient.Post(serverURL+"/api/auth/login", "application/json", bytes.NewReader(loginBody))
-	zeroBytes(loginBody)
-	if err != nil {
-		fatal("login request failed: %v", err)
-	}
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		fatal("login failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
-	}
-
-	var loginResp loginResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&loginResp); err != nil {
-		fatal("failed to parse login response: %v", err)
-	}
-	resp.Body.Close()
-
-	// Derive master key: decrypt the encrypted master key from server
-	masterKey, err := decryptMasterKey(loginResp.EncryptedMasterKey, password, loginResp.KDFSalt, loginResp.UserID)
-	zeroBytes(password)
-	if err != nil {
-		fatal("failed to decrypt master key: %v", err)
-	}
-	defer zeroBytes(masterKey)
-
-	// Copy token into a []byte so it can be wiped from memory after the last
-	// API call. Release the string reference so GC can reclaim the original.
-	token := []byte(loginResp.Token)
-	loginResp.Token = ""
-	defer zeroBytes(token)
+	sess := login(connFlags{serverURL: serverURL, username: username, password: password})
+	// login() zeroes password internally as soon as it's done with it.
+	defer sess.zero()
 
 	fmt.Fprintf(os.Stderr, "Authenticated. Uploading %d file(s)...\n\n", len(files))
 
 	success, fail := 0, 0
 	for _, f := range files {
 		fmt.Fprintf(os.Stderr, "  file %d/%d ", success+fail+1, len(files))
-		if err := uploadFile(uploadClient, serverURL, token, masterKey, f); err != nil {
+		if err := uploadFile(uploadClient, serverURL, sess, f); err != nil {
 			// Error details intentionally omitted — server responses may contain
 			// information useful for fingerprinting or probing the API.
 			fmt.Fprintf(os.Stderr, "FAILED\n")
@@ -284,7 +282,7 @@ func decryptMasterKey(encB64 string, password []byte, kdfSaltB64, userID string)
 	return crypto.DecryptBlock(encData, sessionKey, []byte(userID))
 }
 
-func uploadFile(client *http.Client, serverURL string, token []byte, masterKey []byte, filePath string) error {
+func uploadFile(client *http.Client, serverURL string, sess *userSession, filePath string) error {
 	// Resolve to absolute path so filenames starting with "-" aren't
 	// interpreted as flags by ffmpeg/ffprobe.
 	absPath, err := filepath.Abs(filePath)
@@ -389,7 +387,10 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 	}
 	chunkCount := len(segments)
 
-	// Generate keys
+	// Three per-file symmetric keys, each sealed to the user's X25519 public
+	// key. Using separate keys for file/thumbnail/metadata means no one key
+	// unlocks everything, and the metadata key in particular can be given to
+	// a delegated client for renaming without granting chunk-read access.
 	fileKey, err := crypto.GenerateFileKey()
 	if err != nil {
 		return err
@@ -402,6 +403,12 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 	}
 	defer zeroBytes(thumbKey)
 
+	metadataKey, err := crypto.GenerateFileKey()
+	if err != nil {
+		return err
+	}
+	defer zeroBytes(metadataKey)
+
 	mediaID := uuid.New().String()
 	mediaIDBytes := []byte(mediaID)
 
@@ -410,13 +417,20 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 
-	encFileKey, err := crypto.EncryptKey(fileKey, masterKey, mediaIDBytes)
+	// Seal each symmetric key to the user's X25519 public key. The server
+	// validates exactly 92 bytes (SealBoxOverhead + 32) — anything else
+	// is rejected at the upload handler.
+	fileKeySealed, err := crypto.SealBox(fileKey, sess.publicKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("seal file key: %w", err)
 	}
-	encThumbKey, err := crypto.EncryptKey(thumbKey, masterKey, mediaIDBytes)
+	thumbKeySealed, err := crypto.SealBox(thumbKey, sess.publicKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("seal thumb key: %w", err)
+	}
+	metadataKeySealed, err := crypto.SealBox(metadataKey, sess.publicKey)
+	if err != nil {
+		return fmt.Errorf("seal metadata key: %w", err)
 	}
 
 	metaMap := map[string]any{
@@ -447,7 +461,10 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 	// blob size does not reveal filename length or metadata field presence.
 	metadataPlain = padToBucket(metadataPlain, 512)
 	defer zeroBytes(metadataPlain) // wipe filename and other metadata from memory
-	metadataEnc, err := crypto.EncryptBlock(metadataPlain, masterKey, mediaIDBytes)
+	// Encrypt metadata with its OWN key, not the master key — the browser and
+	// PPVDA upload paths do this so a delegated client can rotate metadata
+	// without holding the master key.
+	metadataEnc, err := crypto.EncryptBlock(metadataPlain, metadataKey, mediaIDBytes)
 	if err != nil {
 		return err
 	}
@@ -455,12 +472,13 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 	metadataCiphertext := metadataEnc[12:]
 
 	uploadMeta := map[string]any{
-		"media_id":       mediaID,
-		"chunk_count":    chunkCount,
-		"file_key_enc":   base64.StdEncoding.EncodeToString(encFileKey),
-		"thumb_key_enc":  base64.StdEncoding.EncodeToString(encThumbKey),
-		"metadata_enc":   base64.StdEncoding.EncodeToString(metadataCiphertext),
-		"metadata_nonce": base64.StdEncoding.EncodeToString(metadataNonce),
+		"media_id":            mediaID,
+		"chunk_count":         chunkCount,
+		"file_key_sealed":     base64.StdEncoding.EncodeToString(fileKeySealed),
+		"thumb_key_sealed":    base64.StdEncoding.EncodeToString(thumbKeySealed),
+		"metadata_key_sealed": base64.StdEncoding.EncodeToString(metadataKeySealed),
+		"metadata_enc":        base64.StdEncoding.EncodeToString(metadataCiphertext),
+		"metadata_nonce":      base64.StdEncoding.EncodeToString(metadataNonce),
 	}
 	uploadMeta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
 
@@ -550,7 +568,7 @@ func uploadFile(client *http.Client, serverURL string, token []byte, masterKey [
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+string(token))
+	req.Header.Set("Authorization", "Bearer "+string(sess.token))
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := client.Do(req)
@@ -629,27 +647,51 @@ func scanFMP4Segments(filePath string) []segment {
 	var moofOffsets []int64
 	pos := int64(0)
 
+	// Cap on moof offsets — a crafted mp4 with millions of empty moofs would
+	// otherwise grow this slice without bound. 50k matches the server's
+	// chunk-count limit, so anything past that would fail upload anyway.
+	const maxMoofOffsets = 100_000
+
 	for pos < fileSize {
 		if _, err := f.ReadAt(header[:8], pos); err != nil {
 			break
 		}
-		boxSize := int64(binary.BigEndian.Uint32(header[:4]))
+		rawSize := binary.BigEndian.Uint32(header[:4])
 		boxType := string(header[4:8])
-		if boxSize == 1 && pos+16 <= fileSize {
+		var boxSize int64
+		if rawSize == 1 {
+			// 64-bit extended size. Read as uint64, reject values that don't
+			// fit in int64 — a negative int64 would make pos+boxSize wrap
+			// backwards or satisfy the later bounds check, causing an
+			// infinite loop or OOB read on a malicious file.
+			if pos+16 > fileSize {
+				break
+			}
 			if _, err := f.ReadAt(header[:16], pos); err != nil {
 				break
 			}
-			boxSize = int64(binary.BigEndian.Uint64(header[8:16]))
-		}
-		if boxSize == 0 {
+			largeSize := binary.BigEndian.Uint64(header[8:16])
+			if largeSize > math.MaxInt64 {
+				break
+			}
+			boxSize = int64(largeSize)
+			if boxSize < 16 {
+				break
+			}
+		} else if rawSize == 0 {
 			boxSize = fileSize - pos
+		} else {
+			boxSize = int64(rawSize)
 		}
-		if boxSize < 8 || pos+boxSize > fileSize {
+		if boxSize < 8 || pos > fileSize-boxSize {
 			break
 		}
 
 		if boxType == "moof" {
 			moofOffsets = append(moofOffsets, pos)
+			if len(moofOffsets) > maxMoofOffsets {
+				return nil
+			}
 		}
 		pos += boxSize
 	}
@@ -1168,7 +1210,7 @@ func validateServerURL(serverURL string) {
 // login authenticates and returns (token, masterKey). Caller must zeroBytes both.
 // Zeroes the password in cf after use. Token is returned as []byte (not string)
 // so the caller can wipe it from memory after the last API call.
-func login(cf connFlags) ([]byte, []byte) {
+func login(cf connFlags) *userSession {
 	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: newHTTPTransport()}
 	jsonBody := buildAuthJSON(cf.username, cf.password)
 	resp, err := client.Post(cf.serverURL+"/api/auth/login", "application/json", bytes.NewReader(jsonBody))
@@ -1192,9 +1234,36 @@ func login(cf connFlags) ([]byte, []byte) {
 	if err != nil {
 		fatal("failed to decrypt master key: %v", err)
 	}
+
+	// Unwrap the X25519 private key. The server stores it as AES-256-GCM
+	// ciphertext under the master key, with userID as AAD. Required for
+	// opening file/thumb/metadata keys returned by /api/media, which are
+	// sealed to the user's public key rather than wrapped with master key.
+	publicKey, err := base64.StdEncoding.DecodeString(lr.PublicKey)
+	if err != nil || len(publicKey) != crypto.X25519PublicKeySize {
+		fatal("login response has malformed public_key")
+	}
+	encPriv, err := base64.StdEncoding.DecodeString(lr.EncryptedPrivKey)
+	if err != nil {
+		fatal("login response has malformed encrypted_priv_key")
+	}
+	privKey, err := crypto.DecryptBlock(encPriv, masterKey, []byte(lr.UserID))
+	if err != nil {
+		fatal("failed to decrypt private key: %v", err)
+	}
+	if len(privKey) != crypto.X25519PrivateKeySize {
+		fatal("decrypted private key has wrong length: %d", len(privKey))
+	}
+
 	token := []byte(lr.Token)
 	lr.Token = "" // release the string reference so GC can reclaim the original
-	return token, masterKey
+	return &userSession{
+		token:     token,
+		masterKey: masterKey,
+		publicKey: publicKey,
+		privKey:   privKey,
+		userID:    lr.UserID,
+	}
 }
 
 // sanitizeServerResponse strips non-printable characters and truncates for safe display.
@@ -1212,15 +1281,20 @@ func sanitizeServerResponse(b []byte) string {
 	return string(s)
 }
 
-// apiMediaItem matches the JSON returned by GET /api/media.
+// apiMediaItem matches the JSON returned by GET /api/media. The *KeySealed
+// fields are X25519 sealed boxes (92 bytes each) wrapping a 32-byte AES key;
+// open with the user's private key via crypto.OpenSealedBox. Each key is used
+// to decrypt a specific blob: fileKey for chunks, thumbKey for thumbnail,
+// metadataKey for the metadata JSON.
 type apiMediaItem struct {
-	ID            string `json:"id"`
-	FileKeyEnc    string `json:"file_key_enc"`
-	ThumbKeyEnc   string `json:"thumb_key_enc"`
-	HashNonce     string `json:"hash_nonce"`
-	MetadataEnc   string `json:"metadata_enc"`
-	MetadataNonce string `json:"metadata_nonce"`
-	CreatedAt     string `json:"created_at"`
+	ID                string `json:"id"`
+	FileKeySealed     string `json:"file_key_sealed"`
+	ThumbKeySealed    string `json:"thumb_key_sealed"`
+	MetadataKeySealed string `json:"metadata_key_sealed"`
+	HashNonce         string `json:"hash_nonce"`
+	MetadataEnc       string `json:"metadata_enc"`
+	MetadataNonce     string `json:"metadata_nonce"`
+	CreatedAt         string `json:"created_at"`
 }
 
 type mediaMetadata struct {
@@ -1234,13 +1308,23 @@ type mediaMetadata struct {
 	Duration   float64 `json:"duration,omitempty"`
 }
 
-func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error) {
+func decryptMetadata(item apiMediaItem, publicKey, privKey []byte) (*mediaMetadata, error) {
 	// Hard cap on metadata size. Real metadata is <1 KB (filename, mime, dims,
 	// duration); anything beyond this is a hostile/compromised server trying to
 	// exhaust client memory before AES-GCM authentication fails.
 	if len(item.MetadataEnc) > maxMetadataBytes {
 		return nil, fmt.Errorf("metadata too large: %d bytes", len(item.MetadataEnc))
 	}
+	sealed, err := base64.StdEncoding.DecodeString(item.MetadataKeySealed)
+	if err != nil {
+		return nil, fmt.Errorf("metadata_key_sealed: %w", err)
+	}
+	metadataKey, err := crypto.OpenSealedBox(sealed, publicKey, privKey)
+	if err != nil {
+		return nil, fmt.Errorf("open metadata key: %w", err)
+	}
+	defer zeroBytes(metadataKey)
+
 	encData, err := base64.StdEncoding.DecodeString(item.MetadataEnc)
 	if err != nil {
 		return nil, err
@@ -1255,7 +1339,7 @@ func decryptMetadata(item apiMediaItem, masterKey []byte) (*mediaMetadata, error
 	copy(combined[len(nonce):], encData)
 	aad := []byte(item.ID)
 
-	plaintext, err := crypto.DecryptBlock(combined, masterKey, aad)
+	plaintext, err := crypto.DecryptBlock(combined, metadataKey, aad)
 	if err != nil {
 		return nil, err
 	}
@@ -1306,11 +1390,10 @@ func fetchAllMedia(serverURL string, token []byte) ([]apiMediaItem, error) {
 
 func cmdList() {
 	cf, _ := parseConnFlags(os.Args[2:])
-	token, masterKey := login(cf)
-	defer zeroBytes(masterKey)
-	defer zeroBytes(token)
+	sess := login(cf)
+	defer sess.zero()
 
-	items, err := fetchAllMedia(cf.serverURL, token)
+	items, err := fetchAllMedia(cf.serverURL, sess.token)
 	if err != nil {
 		fatal("failed to list media: %v", err)
 	}
@@ -1322,7 +1405,7 @@ func cmdList() {
 
 	fmt.Printf("%-36s  %-8s  %-10s  %s\n", "ID", "TYPE", "SIZE", "NAME")
 	for _, item := range items {
-		meta, err := decryptMetadata(item, masterKey)
+		meta, err := decryptMetadata(item, sess.publicKey, sess.privKey)
 		if err != nil {
 			fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, "?", "?", "(decryption failed)")
 			continue
@@ -1366,11 +1449,10 @@ func cmdDownload() {
 		outDir = "."
 	}
 
-	token, masterKey := login(cf)
-	defer zeroBytes(masterKey)
-	defer zeroBytes(token)
+	sess := login(cf)
+	defer sess.zero()
 
-	items, err := fetchAllMedia(cf.serverURL, token)
+	items, err := fetchAllMedia(cf.serverURL, sess.token)
 	if err != nil {
 		fatal("failed to list media: %v", err)
 	}
@@ -1415,7 +1497,7 @@ func cmdDownload() {
 	success, fail := 0, 0
 
 	for i, item := range toDownload {
-		meta, err := decryptMetadata(item, masterKey)
+		meta, err := decryptMetadata(item, sess.publicKey, sess.privKey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  [%d/%d] %s — decryption failed, skipping\n", i+1, len(toDownload), item.ID)
 			fail++
@@ -1425,14 +1507,14 @@ func cmdDownload() {
 		displayName := sanitizeServerResponse([]byte(meta.Name))
 		fmt.Fprintf(os.Stderr, "  [%d/%d] %s ", i+1, len(toDownload), displayName)
 
-		// Decrypt file key
-		fileKeyEnc, err := base64.StdEncoding.DecodeString(item.FileKeyEnc)
+		// Open the sealed file key with the user's X25519 private key.
+		fileKeySealed, err := base64.StdEncoding.DecodeString(item.FileKeySealed)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
 			continue
 		}
-		fileKey, err := crypto.DecryptKey(fileKeyEnc, masterKey, []byte(item.ID))
+		fileKey, err := crypto.OpenSealedBox(fileKeySealed, sess.publicKey, sess.privKey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
@@ -1523,7 +1605,7 @@ func cmdDownload() {
 					}
 				}
 				req, _ := http.NewRequestWithContext(fetchCtx, "GET", fmt.Sprintf("%s/api/media/%s/chunk/%d", cf.serverURL, item.ID, ci), nil)
-				req.Header.Set("Authorization", "Bearer "+string(token))
+				req.Header.Set("Authorization", "Bearer "+string(sess.token))
 				resp, err := client.Do(req)
 				if err != nil {
 					res.err = err
@@ -1577,11 +1659,25 @@ func cmdDownload() {
 			nextLaunch++
 		}
 
+		// Cap on total decrypted bytes per item. Without this, a compromised
+		// server could feed us 20 MB × 50k chunks = 1 TB before the per-chunk
+		// limits alone would stop it. 50 GB is generous for real media and
+		// ~2 orders of magnitude below the pathological worst case.
+		const maxItemBytes int64 = 50 << 30
+
 		// Write chunks in order, launching new fetches as slots free up
 		ok := true
+		var totalBytes int64
 		for ci := 0; ci < meta.ChunkCount; ci++ {
 			res := <-window[ci%windowSize]
 			if res.err != nil {
+				ok = false
+				break
+			}
+			totalBytes += int64(len(res.data))
+			if totalBytes > maxItemBytes {
+				zeroBytes(res.data)
+				fmt.Fprintf(os.Stderr, "FAILED (item exceeds %d bytes)\n", maxItemBytes)
 				ok = false
 				break
 			}

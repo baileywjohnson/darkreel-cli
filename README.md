@@ -2,16 +2,12 @@
 
 Command-line client for [Darkreel](https://github.com/baileywjohnson/darkreel) — upload, list, and download encrypted media. All encryption and decryption happens locally. The server never sees your plaintext files.
 
-> ## ⚠ Server compatibility
+> ## Server compatibility
 >
-> **This CLI targets Darkreel schema v1** (pre-delegation, pre-sealed-box uploads). Releases up to and including **v0.2.5** speak the legacy `file_key_enc` / `thumb_key_enc` / master-key-wrapped metadata wire format.
+> - **v0.3.0+** speaks Darkreel **schema v2** (sealed-box uploads, X25519 per-file keys). Required for any Darkreel server released alongside delegated-upload support.
+> - **v0.2.x and earlier** speak **schema v1** only (legacy `file_key_enc` / master-key-wrapped metadata) and will be rejected by v2 servers with `sealed key has wrong length`.
 >
-> Darkreel schema v2 (released alongside delegated-upload support) rejects this wire format with `sealed key has wrong length`. Until a v0.3.x release ships with v2 support, options for v2 Darkreel servers are:
->
-> - **Browser uploads** via Darkreel's web UI — full feature parity including fMP4 streaming.
-> - **Delegated uploads** via [PPVDA](https://github.com/baileywjohnson/ppvda) — Connect your Darkreel account once and PPVDA handles the sealed-box upload natively.
->
-> v0.3.x will add a `drk connect` subcommand that performs the same copy-paste authorization flow as PPVDA and switches upload/list/download to the sealed-box protocol. Track progress in the repo's release notes.
+> The CLI still authenticates with username + `DRK_PASS` (no copy-paste delegation flow — it's your own machine, so full-account access is simpler). What changed in v0.3.0 is the on-wire crypto: per-file `fileKey` / `thumbKey` / `metadataKey` are now generated locally and sealed to the account's X25519 public key, matching what Darkreel's web SPA and PPVDA produce.
 
 ## Features
 
