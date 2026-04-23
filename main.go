@@ -137,7 +137,9 @@ Usage:
   drk download -server URL -user USERNAME [-o DIR] [ID...]
 
 Environment variables:
-  DRK_PASS    Password (required; not accepted as a CLI flag for security)
+  DRK_PASS    Password (alternative to -pw-stdin; cleared from env immediately
+              after read, but visible in /proc/<pid>/environ for a brief
+              window between exec and unset — prefer -pw-stdin in scripts)
   DRK_SERVER  Server URL (fallback if -server not provided)
   DRK_USER    Username (fallback if -user not provided)
 
@@ -150,6 +152,9 @@ Common flags:
   -server   Server URL (e.g., https://media.example.com)
   -user     Username
   -insecure Allow plaintext HTTP for non-localhost URLs
+  -pw-stdin Read the password from stdin (one line, trailing newline stripped)
+            — stdin bytes never enter the process environment, so this closes
+            the exec-time /proc/<pid>/environ leak DRK_PASS opens.
 
 Upload flags:
   -register Register a new account before uploading
@@ -165,7 +170,7 @@ func cmdUpload() {
 	}
 
 	var serverURL, username string
-	var register, insecure bool
+	var register, insecure, pwStdin bool
 	var files []string
 
 	args := os.Args[2:]
@@ -187,6 +192,8 @@ func cmdUpload() {
 			register = true
 		case "-insecure":
 			insecure = true
+		case "-pw-stdin":
+			pwStdin = true
 		default:
 			files = append(files, args[i])
 		}
@@ -199,12 +206,12 @@ func cmdUpload() {
 	if username == "" {
 		username = os.Getenv("DRK_USER")
 	}
-	// Password must come from environment variable only (never a CLI flag)
-	password := []byte(os.Getenv("DRK_PASS"))
-	os.Unsetenv("DRK_PASS") // remove from process environment immediately
+	// Password from stdin (preferred — never enters the process environment)
+	// or DRK_PASS env var (legacy — unset immediately after read).
+	password := readPasswordSource(pwStdin)
 
 	if serverURL == "" || username == "" || len(password) == 0 {
-		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
+		fmt.Fprintln(os.Stderr, "Error: -server, -user, and a password (via DRK_PASS or -pw-stdin) are required")
 		os.Exit(1)
 	}
 	validateServerURL(serverURL)
@@ -1131,9 +1138,37 @@ type connFlags struct {
 	insecure  bool   // allow plaintext HTTP for non-localhost
 }
 
+// readPasswordFromStdin reads one line from stdin as the password, stripping
+// a trailing newline. Unlike DRK_PASS, which briefly appears in os.Environ()
+// between exec and Unsetenv and can be observed via /proc/<pid>/environ or a
+// core dump during that window, stdin bytes never enter the process
+// environment. Prefer this when calling the CLI from a script that already
+// has the password in memory (e.g. via `printf %s "$pw" | drk ... -pw-stdin`).
+func readPasswordFromStdin() ([]byte, error) {
+	// Cap at 64 KiB — enforcement matches the server's register/login
+	// body limit; anything larger is a script bug, not a real password.
+	const maxPw = 64 << 10
+	buf, err := io.ReadAll(io.LimitReader(os.Stdin, maxPw+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) > maxPw {
+		return nil, fmt.Errorf("password from stdin exceeds %d bytes", maxPw)
+	}
+	// Strip a single trailing \r?\n so `echo pw | drk` works.
+	for len(buf) > 0 && (buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r') {
+		buf = buf[:len(buf)-1]
+	}
+	if len(buf) == 0 {
+		return nil, fmt.Errorf("stdin provided an empty password")
+	}
+	return buf, nil
+}
+
 func parseConnFlags(args []string) (connFlags, []string) {
 	var cf connFlags
 	var rest []string
+	pwStdin := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-server":
@@ -1150,25 +1185,44 @@ func parseConnFlags(args []string) (connFlags, []string) {
 			cf.username = args[i]
 		case "-insecure":
 			cf.insecure = true
+		case "-pw-stdin":
+			pwStdin = true
 		default:
 			rest = append(rest, args[i])
 		}
 	}
+	// Re-shift the loop counter state (the outer for used `i := 0`, already
+	// done above by the case bodies — this helper is just a no-op marker).
 	if cf.serverURL == "" {
 		cf.serverURL = strings.TrimRight(os.Getenv("DRK_SERVER"), "/")
 	}
 	if cf.username == "" {
 		cf.username = os.Getenv("DRK_USER")
 	}
-	cf.password = []byte(os.Getenv("DRK_PASS"))
-	os.Unsetenv("DRK_PASS") // remove from process environment immediately
+	cf.password = readPasswordSource(pwStdin)
 	if cf.serverURL == "" || cf.username == "" || len(cf.password) == 0 {
-		fmt.Fprintln(os.Stderr, "Error: -server, -user, and DRK_PASS environment variable are required")
+		fmt.Fprintln(os.Stderr, "Error: -server, -user, and a password (via DRK_PASS or -pw-stdin) are required")
 		os.Exit(1)
 	}
 	validateServerURL(cf.serverURL)
 	requireHTTPS(cf.serverURL, cf.insecure)
 	return cf, rest
+}
+
+// readPasswordSource returns the password from stdin (preferred — never
+// enters the process environment) or DRK_PASS. Callers that hit either path
+// end up with cf.password as a []byte that zeroBytes can wipe after use.
+func readPasswordSource(pwStdin bool) []byte {
+	if pwStdin {
+		pw, err := readPasswordFromStdin()
+		if err != nil {
+			fatal("failed to read password from stdin: %v", err)
+		}
+		return pw
+	}
+	pw := []byte(os.Getenv("DRK_PASS"))
+	os.Unsetenv("DRK_PASS") // remove from process environment immediately
+	return pw
 }
 
 // requireHTTPS blocks plaintext HTTP for non-localhost URLs unless -insecure is set.
