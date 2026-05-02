@@ -37,6 +37,23 @@ const (
 
 var sealInfo = []byte("darkreel-seal-v1")
 
+// DerivePublicKey returns the X25519 public key for the given private key
+// by computing priv·basepoint. Used to verify that a server-supplied
+// public key actually matches the private key the client just decrypted —
+// without this check, a hostile server can hand out an attacker-controlled
+// public key paired with a valid wrapped private key, and every
+// subsequent SealBox call seals to the attacker.
+func DerivePublicKey(priv []byte) ([]byte, error) {
+	if len(priv) != X25519PrivateKeySize {
+		return nil, fmt.Errorf("derive public key: private key must be %d bytes, got %d", X25519PrivateKeySize, len(priv))
+	}
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("derive public key: %w", err)
+	}
+	return pub, nil
+}
+
 // GenerateKeypair returns a new X25519 keypair. The private key is clamped
 // per RFC 7748 §5 so it's safe to use directly with curve25519.
 func GenerateKeypair() ([]byte, []byte, error) {

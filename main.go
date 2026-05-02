@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -1307,6 +1308,19 @@ func login(cf connFlags) *userSession {
 	}
 	if len(privKey) != crypto.X25519PrivateKeySize {
 		fatal("decrypted private key has wrong length: %d", len(privKey))
+	}
+
+	// Verify that the server-supplied public key actually matches the
+	// private key we just decrypted. Without this check, a hostile server
+	// could pair a valid wrapped private key with an attacker-controlled
+	// public key, causing every subsequent SealBox call (file/thumb/metadata
+	// keys) to seal to the attacker rather than to us.
+	derivedPub, err := crypto.DerivePublicKey(privKey)
+	if err != nil {
+		fatal("failed to derive public key from decrypted private key: %v", err)
+	}
+	if subtle.ConstantTimeCompare(derivedPub, publicKey) != 1 {
+		fatal("login response public_key does not match decrypted private key — server may be malicious")
 	}
 
 	token := []byte(lr.Token)
