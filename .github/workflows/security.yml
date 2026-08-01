@@ -17,9 +17,13 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          # Use the latest stable Go so this job catches runtime/stdlib CVEs
-          # patched past the go.mod minimum, not just module-level CVEs.
-          go-version: stable
+          # Scan with the SAME toolchain release.yml builds with, so this job
+          # reports on the binary we actually ship. This previously used
+          # `go-version: stable`, which passed while the released binaries —
+          # built from go.mod's pinned 1.26.2 — carried five known stdlib CVEs.
+          # Pinned, a new stdlib CVE fails the weekly cron until the `go`
+          # directive is bumped, which is also the fix.
+          go-version-file: go.mod
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
