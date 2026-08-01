@@ -23,7 +23,7 @@ Command-line client for [Darkreel](https://github.com/baileywjohnson/darkreel) �
 
 ## Minimum requirements
 
-- Go 1.26.2+ (to build from source — pinned for stdlib CVE coverage)
+- Go 1.26.5+ (to build from source — the `go` directive is pinned to the toolchain govulncheck verifies in CI, so stdlib CVEs surface as a failing build)
 - ffmpeg (optional, for video thumbnails and fMP4 remuxing — placeholders used if unavailable)
 - ffprobe (optional, for video codec detection — defaults used if unavailable)
 
