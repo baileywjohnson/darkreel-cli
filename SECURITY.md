@@ -15,7 +15,7 @@ darkreel-cli is a client for a [Darkreel](https://github.com/baileywjohnson/dark
 
 - **Same-UID processes on the host *when using `DRK_PASS`*.** The env var path leaves the password briefly readable from `/proc/<pid>/environ` between exec and the first `os.Unsetenv` call. `os.Unsetenv` clears the Go runtime's environment map — useful for preventing subprocesses from inheriting the value — but it does not scrub kernel-visible environ. **Use `-pw-stdin` (v0.3.1+) to close this window entirely**: stdin bytes never enter the process environment, so `/proc/<pid>/environ` never contains the password at any point. The `DRK_PASS` path is retained for backwards compatibility.
 - **Kernel and Go-runtime side channels**: swap, core dumps, GC heap residue, memory compression. Sensitive `[]byte` buffers are zeroed on best-effort basis; this does not defend against a root attacker.
-- **Attackers with write access to the binary** (e.g., tampered build artifacts). Use the signed release checksums.
+- **Attackers with write access to the binary** (e.g., tampered build artifacts). Release binaries come with a `SHA256SUMS` file; it detects corrupted downloads but is not signed, so it does not authenticate a release on its own.
 
 ## Cryptographic notes
 
@@ -48,7 +48,7 @@ Email **baileywjohnson@gmail.com** with details. Please do not open a public iss
 
 ## Supported versions
 
-Only the latest tagged release receives security updates. Binaries are built and signed via GitHub Actions; verify the `SHA256SUMS` file before running.
+Only the latest tagged release receives security updates. Binaries are built via GitHub Actions; verify them against the `SHA256SUMS` file before running.
 
 ## Dependency hygiene
 

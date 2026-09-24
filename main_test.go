@@ -2,6 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,43 +125,142 @@ func TestIsVideo(t *testing.T) {
 
 // ---- Filename sanitization for downloads ----
 //
-// Mirrors the logic in cmdDownload: filepath.Base strips directory components,
-// then dotfile names are prefixed with the media ID to prevent overwriting
-// shell configs when downloading into a home directory.
+// These exercise the functions cmdDownload actually calls. (An earlier
+// version tested a copy of the logic, which is how a traversal via the
+// media-ID fallback went unnoticed.)
 
-func sanitizeDownloadName(name, mediaID string) string {
-	safe := filepath.Base(name)
-	if safe == "." || safe == ".." || safe == "" {
-		safe = mediaID
-	}
-	if strings.HasPrefix(safe, ".") {
-		safe = mediaID + "_" + strings.TrimLeft(safe, ".")
-	}
-	return safe
-}
+const testMediaID = "3f2b8c4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
 
-func TestSanitizeDownloadName(t *testing.T) {
-	mediaID := "abc-123"
+func TestLocalFileName(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
 		{"photo.jpg", "photo.jpg"},
-		{"../../etc/passwd", "passwd"},
-		{"/abs/path/vid.mp4", "vid.mp4"},
-		{"..", "abc-123"},
-		{".", "abc-123"},
-		{"", "abc-123"},
-		{".bashrc", "abc-123_bashrc"},
-		{".ssh/authorized_keys", "authorized_keys"}, // filepath.Base strips the dot-dir
-		{"...hidden.jpg", "abc-123_hidden.jpg"},
-		{".env", "abc-123_env"},
+		{"../../etc/passwd", testMediaID + "__.._etc_passwd"},
+		{"/abs/path/vid.mp4", "_abs_path_vid.mp4"},
+		{`..\..\win.ini`, testMediaID + "__.._win.ini"},
+		{"..", testMediaID},
+		{".", testMediaID},
+		{"", testMediaID},
+		{"   ", testMediaID},
+		{".bashrc", testMediaID + "_bashrc"},
+		{".ssh/authorized_keys", testMediaID + "_ssh_authorized_keys"},
+		{"...hidden.jpg", testMediaID + "_hidden.jpg"},
+		{"evil\x1b]52;c;aGk=\x07.jpg", "evil]52;c;aGk=.jpg"},
+		{"caf\u00e9.jpg", "caf\u00e9.jpg"},
+		{"gpj.\u202eexe", "gpj.exe"},
 	}
 	for _, tc := range cases {
-		got := sanitizeDownloadName(tc.in, mediaID)
+		got := localFileName(tc.in, testMediaID)
 		if got != tc.want {
-			t.Errorf("sanitizeDownloadName(%q) = %q, want %q", tc.in, got, tc.want)
+			t.Errorf("localFileName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+		if !filepath.IsLocal(got) || strings.ContainsAny(got, `/\`) {
+			t.Errorf("localFileName(%q) = %q is not a single local path component", tc.in, got)
+		}
+	}
+}
+
+func TestSanitizeTerminal(t *testing.T) {
+	in := "a\x1b[2Jb\x9bc\u202ed\te\nf"
+	if got := sanitizeTerminal(in); got != "a[2Jbcdef" {
+		t.Errorf("sanitizeTerminal(%q) = %q", in, got)
+	}
+}
+
+func TestIsCanonicalUUID(t *testing.T) {
+	for _, ok := range []string{testMediaID} {
+		if !isCanonicalUUID(ok) {
+			t.Errorf("isCanonicalUUID(%q) = false", ok)
+		}
+	}
+	for _, bad := range []string{
+		"", "../../home/victim/.bashrc", "urn:uuid:" + testMediaID,
+		"{" + testMediaID + "}", strings.ReplaceAll(testMediaID, "-", ""),
+		strings.ToUpper(testMediaID),
+	} {
+		if isCanonicalUUID(bad) {
+			t.Errorf("isCanonicalUUID(%q) = true", bad)
+		}
+	}
+}
+
+func TestPublishNoClobber(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	if err := os.WriteFile(filepath.Join(dir, "clip.mp4"), []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"clip (1).mp4", "clip (2).mp4"} {
+		tmp := fmt.Sprintf(".part%d", i)
+		if err := root.WriteFile(tmp, []byte("new"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := publishNoClobber(root, tmp, "clip.mp4")
+		if err != nil || got != want {
+			t.Fatalf("publishNoClobber = %q, %v; want %q", got, err, want)
+		}
+		if _, err := root.Lstat(tmp); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("temp file %s left behind", tmp)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "clip.mp4")); string(b) != "existing" {
+		t.Errorf("existing file was overwritten: %q", b)
+	}
+}
+
+func TestRootRejectsEscape(t *testing.T) {
+	// Defense in depth: even if a bad name slipped past localFileName, the
+	// os.Root the download writes through must refuse to leave outDir,
+	// including via a pre-planted symlink.
+	parent := t.TempDir()
+	out := filepath.Join(parent, "out")
+	if err := os.Mkdir(out, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(parent, filepath.Join(out, "link")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, name := range []string{"../escape", "link/escape", "/tmp/escape"} {
+		if f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err == nil {
+			f.Close()
+			t.Errorf("os.Root allowed creating %q", name)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(parent, "escape")); err == nil {
+		t.Error("file escaped the output directory")
+	}
+}
+
+func TestFetchAllMediaDropsNonUUIDIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]string{
+				{"id": testMediaID},
+				{"id": "../../../home/victim/.bashrc"},
+				{"id": "urn:uuid:" + testMediaID},
+			},
+			"total": 3,
+		})
+	}))
+	defer srv.Close()
+	items, err := fetchAllMedia(srv.URL, []byte("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != testMediaID {
+		t.Fatalf("fetchAllMedia returned %+v, want only the canonical UUID item", items)
 	}
 }
 

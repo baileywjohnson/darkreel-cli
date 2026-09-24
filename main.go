@@ -9,12 +9,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
 	_ "image/gif"
 	_ "image/png"
 	"io"
+	"io/fs"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -26,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/baileywjohnson/darkreel-cli/internal/crypto"
 	"github.com/google/uuid"
@@ -345,18 +349,14 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 		codecString, videoWidth, videoHeight, videoDuration = probeVideoInfo(filePath)
 	}
 
-	// Always generate a hash nonce so the server cannot distinguish
-	// modified from unmodified files by presence/absence of the field.
-	hashNonce, err := crypto.GenerateHashNonce()
-	if err != nil {
-		return fmt.Errorf("generate hash nonce: %w", err)
-	}
-	// Hash modification — skip for fMP4 remuxed videos (would break container)
+	// Hash modification — skip for fMP4 remuxed videos (would break container).
+	// The embedded nonce is deliberately not sent to the server: a stored
+	// copy would let anyone with DB access link a leaked image back to this
+	// account.
 	if !fragmented {
-		tmpHash, nonce, hashErr := modifyHashToFile(srcPath, mimeType, tmpDir)
+		tmpHash, _, hashErr := modifyHashToFile(srcPath, mimeType, tmpDir)
 		if hashErr == nil {
 			srcPath = tmpHash
-			hashNonce = nonce
 		}
 		// Non-fatal if unsupported format — continue with unmodified file
 	}
@@ -488,7 +488,6 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 		"metadata_enc":        base64.StdEncoding.EncodeToString(metadataCiphertext),
 		"metadata_nonce":      base64.StdEncoding.EncodeToString(metadataNonce),
 	}
-	uploadMeta["hash_nonce"] = base64.StdEncoding.EncodeToString(hashNonce)
 
 	// Stream the multipart body via io.Pipe. Each segment is read from the
 	// source file, encrypted, and written directly to the pipe — only one
@@ -1228,15 +1227,19 @@ func readPasswordSource(pwStdin bool) []byte {
 
 // requireHTTPS blocks plaintext HTTP for non-localhost URLs unless -insecure is set.
 func requireHTTPS(serverURL string, insecure bool) {
-	if !strings.HasPrefix(serverURL, "http://") {
+	// Compare the parsed scheme, not a string prefix: url.Parse accepts
+	// "HTTP://host" as scheme "http", which a case-sensitive prefix check
+	// let through without warning.
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		fatal("invalid server URL")
+	}
+	if !strings.EqualFold(u.Scheme, "http") {
 		return // HTTPS or other — already validated by validateServerURL
 	}
-	u, err := url.Parse(serverURL)
-	if err == nil {
-		host := u.Hostname()
-		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-			return // localhost is exempt
-		}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return // localhost is exempt
 	}
 	if insecure {
 		fmt.Fprintln(os.Stderr, "WARNING: Using plaintext HTTP. Credentials and encryption keys will be sent unencrypted.")
@@ -1359,7 +1362,6 @@ type apiMediaItem struct {
 	FileKeySealed     string `json:"file_key_sealed"`
 	ThumbKeySealed    string `json:"thumb_key_sealed"`
 	MetadataKeySealed string `json:"metadata_key_sealed"`
-	HashNonce         string `json:"hash_nonce"`
 	MetadataEnc       string `json:"metadata_enc"`
 	MetadataNonce     string `json:"metadata_nonce"`
 	CreatedAt         string `json:"created_at"`
@@ -1444,16 +1446,48 @@ func fetchAllMedia(serverURL string, token []byte) ([]apiMediaItem, error) {
 			return nil, fmt.Errorf("invalid response on page %d: %w", page, err)
 		}
 		resp.Body.Close()
-		all = append(all, result.Items...)
+		for _, item := range result.Items {
+			// Item IDs end up in request paths and, as a filename
+			// fallback, in local paths. Anything other than a canonical
+			// UUID came from a misbehaving server and is dropped here, at
+			// the single entry point, rather than at each use.
+			if isCanonicalUUID(item.ID) {
+				all = append(all, item)
+			}
+		}
 		if len(all) > 50000 {
 			break
 		}
-		if len(all) >= result.Total || len(result.Items) == 0 {
+		if len(result.Items) == 0 || len(result.Items) < 200 || page*200 >= result.Total {
 			break
 		}
 		page++
 	}
 	return all, nil
+}
+
+func isCanonicalUUID(id string) bool {
+	u, err := uuid.Parse(id)
+	return err == nil && u.String() == id
+}
+
+// sanitizeTerminal removes characters that a terminal would interpret rather
+// than display: C0/C1 controls (including ESC, so no CSI/OSC sequences such
+// as OSC 52 clipboard writes or OSC 8 links) and Unicode bidi overrides that
+// can visually reorder a line. Printable Unicode is kept.
+func sanitizeTerminal(s string) string {
+	const maxLen = 512
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == utf8.RuneError {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= maxLen {
+			break
+		}
+	}
+	return b.String()
 }
 
 func cmdList() {
@@ -1478,7 +1512,7 @@ func cmdList() {
 			fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, "?", "?", "(decryption failed)")
 			continue
 		}
-		fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, meta.MediaType, formatSize(meta.Size), meta.Name)
+		fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, sanitizeTerminal(meta.MediaType), formatSize(meta.Size), sanitizeTerminal(meta.Name))
 	}
 	fmt.Printf("\n%d items total\n", len(items))
 }
@@ -1525,12 +1559,9 @@ func cmdDownload() {
 		fatal("failed to list media: %v", err)
 	}
 
-	// Build a map for lookup
+	// Build a map for lookup (fetchAllMedia already dropped non-UUID IDs)
 	itemMap := make(map[string]apiMediaItem, len(items))
 	for _, item := range items {
-		if _, err := uuid.Parse(item.ID); err != nil {
-			continue
-		}
 		itemMap[item.ID] = item
 	}
 
@@ -1554,6 +1585,18 @@ func cmdDownload() {
 		return
 	}
 
+	// All output goes through an os.Root: names that try to climb out of
+	// outDir ("..", absolute paths) or symlinks pointing outside it fail
+	// instead of writing wherever the server's metadata says.
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		fatal("cannot create output directory: %v", err)
+	}
+	root, err := os.OpenRoot(outDir)
+	if err != nil {
+		fatal("cannot open output directory: %v", err)
+	}
+	defer root.Close()
+
 	client := &http.Client{
 		Timeout:       10 * time.Minute,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -1572,7 +1615,7 @@ func cmdDownload() {
 			continue
 		}
 
-		displayName := sanitizeServerResponse([]byte(meta.Name))
+		displayName := sanitizeTerminal(meta.Name)
 		fmt.Fprintf(os.Stderr, "  [%d/%d] %s ", i+1, len(toDownload), displayName)
 
 		// Open the sealed file key with the user's X25519 private key.
@@ -1589,21 +1632,19 @@ func cmdDownload() {
 			continue
 		}
 
-		// Fetch and decrypt each chunk via the padded endpoint
-		// Sanitize filename to prevent path traversal from crafted metadata.
-		// filepath.Base strips directory components (e.g., "../../evil" → "evil").
-		safeName := filepath.Base(meta.Name)
-		if safeName == "." || safeName == ".." || safeName == "" {
-			safeName = item.ID // fallback to media ID
+		if meta.ChunkCount <= 0 || meta.ChunkCount > 50000 {
+			fmt.Fprintf(os.Stderr, "FAILED (invalid chunk count %d)\n", meta.ChunkCount)
+			fail++
+			zeroBytes(fileKey)
+			continue
 		}
-		// Reject dotfiles — a crafted server could set meta.Name to ".bashrc"
-		// or similar, which filepath.Base would pass through unchanged, overwriting
-		// shell configs if the user downloads to their home directory.
-		if strings.HasPrefix(safeName, ".") {
-			safeName = item.ID + "_" + strings.TrimLeft(safeName, ".")
-		}
-		outPath := filepath.Join(outDir, safeName)
-		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+
+		// Decrypt into an exclusively created temp file inside outDir; it is
+		// published under its final name only once every chunk verified, so
+		// a failed or truncated download never touches an existing file.
+		safeName := localFileName(meta.Name, item.ID)
+		tmpName := fmt.Sprintf(".darkreel-%s.part", item.ID)
+		outFile, err := root.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
@@ -1626,16 +1667,7 @@ func cmdDownload() {
 			fail++
 			zeroBytes(fileKey)
 			outFile.Close()
-			os.Remove(outPath)
-			continue
-		}
-
-		if meta.ChunkCount <= 0 || meta.ChunkCount > 50000 {
-			fmt.Fprintf(os.Stderr, "FAILED (invalid chunk count %d)\n", meta.ChunkCount)
-			fail++
-			zeroBytes(fileKey)
-			outFile.Close()
-			os.Remove(outPath)
+			root.Remove(tmpName)
 			continue
 		}
 
@@ -1765,14 +1797,25 @@ func cmdDownload() {
 		// next iteration or via the deferred zeroBytes at function exit.
 		fetchCancel()
 		fetchWg.Wait()
-		outFile.Close()
+		if err := outFile.Close(); err != nil {
+			ok = false
+		}
 		zeroBytes(fileKey)
 
+		var finalName string
 		if ok {
-			fmt.Fprintf(os.Stderr, "OK\n")
+			finalName, err = publishNoClobber(root, tmpName, safeName)
+			ok = err == nil
+		}
+		if ok {
+			if finalName != safeName {
+				fmt.Fprintf(os.Stderr, "OK (saved as %s)\n", sanitizeTerminal(finalName))
+			} else {
+				fmt.Fprintf(os.Stderr, "OK\n")
+			}
 			success++
 		} else {
-			os.Remove(outPath) // clean up partial file
+			root.Remove(tmpName) // clean up partial file
 			fmt.Fprintf(os.Stderr, "FAILED\n")
 			fail++
 		}
@@ -1782,6 +1825,64 @@ func cmdDownload() {
 	if fail > 0 {
 		os.Exit(1)
 	}
+}
+
+// localFileName turns a server-supplied display name into a single, local
+// path component. The name comes from encrypted metadata that a malicious
+// server — or any delegated uploader — controls. mediaID must already be a
+// validated canonical UUID; it is the fallback name.
+func localFileName(name, mediaID string) string {
+	name = sanitizeTerminal(name)
+	name = strings.NewReplacer("/", "_", "\\", "_").Replace(name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return mediaID
+	}
+	// Hidden files (".bashrc", ".envrc") could be picked up by tools that
+	// read dotfiles from the output directory; make them visible and
+	// clearly foreign.
+	if strings.HasPrefix(name, ".") {
+		name = mediaID + "_" + strings.TrimLeft(name, ".")
+	}
+	if !filepath.IsLocal(name) {
+		return mediaID
+	}
+	return name
+}
+
+// publishNoClobber gives the finished temp file its final name without ever
+// replacing an existing file: it hard-links under the first free name
+// ("name", "name (1)", ...) — link(2) fails atomically if the target exists —
+// then removes the temp name. Filesystems without hard links fall back to a
+// check-then-rename.
+func publishNoClobber(root *os.Root, tmpName, name string) (string, error) {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 0; i < 1000; i++ {
+		candidate := name
+		if i > 0 {
+			candidate = fmt.Sprintf("%s (%d)%s", base, i, ext)
+		}
+		err := root.Link(tmpName, candidate)
+		if err == nil {
+			root.Remove(tmpName)
+			return candidate, nil
+		}
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		// No hard-link support: fall back to rename if the name is free.
+		if _, statErr := root.Lstat(candidate); errors.Is(statErr, fs.ErrNotExist) {
+			if err := root.Rename(tmpName, candidate); err != nil {
+				return "", err
+			}
+			return candidate, nil
+		} else if statErr == nil {
+			continue
+		}
+		return "", err
+	}
+	return "", fmt.Errorf("no free filename for %q", name)
 }
 
 func formatSize(bytes int64) string {

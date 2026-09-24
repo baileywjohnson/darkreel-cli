@@ -174,7 +174,7 @@ Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadat
 2. For each item: opens the sealed `metadataKey` with the private key and decrypts the metadata blob to get the filename, chunk count, etc.; opens the sealed `fileKey` the same way for chunk decryption
 3. Fetches chunks in parallel (4 workers, connection-pooled) via the padded chunk endpoint
 4. Each chunk: strips server-side padding → decrypts with AES-256-GCM under `fileKey` → writes to disk in order
-5. Downloaded filenames are sanitized (`filepath.Base`) to prevent path traversal
+5. Downloaded files are written through an `os.Root` for the output directory under a sanitized single-component name, and never overwrite an existing file
 6. Per-item total-bytes cap of 50 GB guards against a compromised server padding `chunk_count` × 20 MB per chunk into a TB-scale download
 
 ### List
@@ -238,7 +238,8 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **JWT tokens zeroed** — auth tokens are stored as `[]byte` (not Go `string`) and passed through the upload/list/download call stack as byte slices. The token is zeroed after the last API call, and the original JSON-decoded string field is released so the GC can reclaim it
 - **Plaintext buffers zeroed** — decrypted chunk plaintext is zeroed immediately after being written to disk during download. Upload-side read buffers are zeroed when the upload goroutine exits. Encrypted metadata's plaintext (containing the original filename and file info) is zeroed after encryption
 - **Server responses sanitized** — error bodies stripped of non-printable characters (ANSI escapes, control codes) before display, truncated to 512 chars
-- **Path traversal protection** — downloaded filenames sanitized via `filepath.Base()` to prevent writes outside the output directory. Dotfile names (e.g., `.bashrc`) are prefixed with the media ID to prevent overwriting shell configs when downloading to a home directory
+- **Path traversal protection** — every download is written through an `os.Root` opened on the output directory, so `..`, absolute paths and symlinks pointing outside it are refused by the OS layer. Names from metadata are reduced to a single path component (`/` and `\` replaced), and dotfile names (e.g., `.bashrc`) are prefixed with the media ID
+- **No overwrites** — each file is decrypted into an exclusively created temp file and published under its name only after every chunk verifies; if the name is taken the file is saved as `name (1).ext`, etc. An existing file is never truncated or replaced
 - **Restrictive file permissions** — downloaded files created with `0600` (owner read/write only)
 - **No shell execution** — all subprocesses (ffmpeg, ffprobe) spawned via `exec.Command` with argument arrays, never through a shell
 - **Absolute paths for subprocesses** — file paths resolved to absolute before passing to ffmpeg/ffprobe, preventing `-` prefix filenames from being interpreted as flags
@@ -255,8 +256,8 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **PNG parsing overflow protection** — hash modification for PNG files uses 64-bit arithmetic for chunk length calculations, preventing integer overflow on 32-bit systems and guarding against chunks extending beyond the 64 KB header buffer
 - **Chunk count validation** — downloaded media with invalid chunk counts (outside 1–50,000, matching the server limit) is rejected before allocating memory or spawning workers
 - **Media list pagination bounded** — the total number of items fetched from the server is capped at 50,000, preventing memory exhaustion from a malicious server returning unbounded pagination
-- **Server-provided IDs validated** — media item IDs from the server are validated as UUIDs before use in URL construction and decryption AAD
-- **Filename display sanitization** — filenames from decrypted metadata are stripped of control characters and ANSI escape sequences before terminal output, preventing terminal injection
+- **Server-provided IDs validated** — every media item ID from the server must be a canonical UUID; anything else is dropped when the listing is fetched, before use in URLs, AAD, or as a filename fallback
+- **Filename display sanitization** — filenames and types from decrypted metadata are stripped of control characters (including ESC, so no ANSI/OSC sequences) and Unicode bidi overrides before terminal output, in both `list` and `download`
 - **Metadata blob padding** — encrypted metadata blobs are padded to power-of-2 buckets (minimum 512 bytes) before encryption, preventing the encrypted blob size from revealing filename length or which optional fields are present
 - **Hash nonce always sent** — a random 32-byte hash nonce is always generated and sent to the server, even for formats that don't support hash modification. This prevents the server from inferring file format category by the presence or absence of the field
 - **Connection pool tuning** — download HTTP client's `MaxIdleConnsPerHost` matches the worker count (4), ensuring all parallel chunk fetches reuse connections instead of creating new ones
