@@ -38,7 +38,7 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-const chunkSize = 1 << 20       // 1 MB — used for non-fragmented files only
+const chunkSize = crypto.ChunkDataSize // non-fragmented files: fills exactly one 1 MiB ciphertext bucket
 const subprocessTimeout = 10 * time.Minute // ffmpeg/ffprobe timeout
 const maxMetadataBytes = 1 << 20 // 1 MB — hard cap on encrypted metadata size
 
@@ -380,7 +380,7 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 	// For non-fMP4: fixed 1 MB chunks.
 	var segments []segment
 	if fragmented {
-		segments = scanFMP4Segments(srcPath)
+		segments = mergeSegments(scanFMP4Segments(srcPath), crypto.ChunkDataSize)
 	} else {
 		for start := int64(0); start < fileSize; start += int64(chunkSize) {
 			length := int64(chunkSize)
@@ -420,7 +420,11 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 	mediaID := uuid.New().String()
 	mediaIDBytes := []byte(mediaID)
 
-	encThumb, err := crypto.EncryptChunk(thumbData, thumbKey, 0, mediaID)
+	thumbFrame, err := crypto.FrameThumbnail(thumbData)
+	if err != nil {
+		return fmt.Errorf("thumbnail: %w", err)
+	}
+	encThumb, err := crypto.EncryptChunk(thumbFrame, thumbKey, 0, mediaID)
 	if err != nil {
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
@@ -441,12 +445,20 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 		return fmt.Errorf("seal metadata key: %w", err)
 	}
 
+	// The owner tag marks this as the account owner's own upload; only the
+	// master-key holder (this CLI, or the browser) can compute it.
+	ownerTag, err := crypto.OwnerTag(sess.masterKey, mediaID, fileKeySealed, thumbKeySealed, metadataKeySealed)
+	if err != nil {
+		return fmt.Errorf("owner tag: %w", err)
+	}
 	metaMap := map[string]any{
-		"name":        filepath.Base(filePath),
-		"media_type":  mediaType,
-		"mime_type":   mimeType,
-		"size":        fileSize,
-		"chunk_count": chunkCount,
+		"name":         filepath.Base(filePath),
+		"media_type":   mediaType,
+		"mime_type":    mimeType,
+		"size":         fileSize,
+		"chunk_count":  chunkCount,
+		"chunk_format": crypto.ChunkFormat,
+		"owner_tag":    base64.StdEncoding.EncodeToString(ownerTag),
 	}
 	if fragmented {
 		metaMap["fragmented"] = true
@@ -554,7 +566,13 @@ func uploadFile(client *http.Client, serverURL string, sess *userSession, filePa
 				writeErr = fmt.Errorf("read chunk %d: %w", i, err)
 				return
 			}
-			enc, err := crypto.EncryptChunkWith(gcm, buf, i, mediaID)
+			framed, err := crypto.FrameChunk(buf, i == len(segments)-1)
+			if err != nil {
+				writeErr = fmt.Errorf("chunk %d: %w", i, err)
+				return
+			}
+			enc, err := crypto.EncryptChunkWith(gcm, framed, i, mediaID)
+			zeroBytes(framed)
 			if err != nil {
 				writeErr = fmt.Errorf("encrypt chunk %d: %w", i, err)
 				return
@@ -636,6 +654,27 @@ func remuxToFMP4File(filePath, tmpDir string) (string, bool) {
 // scanFMP4Segments scans an fMP4 file for moof boundaries and returns
 // segment offsets. The first segment is the init segment (everything before
 // the first moof), subsequent segments are moof+mdat pairs.
+// mergeSegments joins consecutive fMP4 fragments into chunks of at most
+// maxLen bytes, so each fills a ciphertext bucket instead of every small
+// fragment being padded to 1 MiB on its own. The first segment (the init
+// segment) stays separate; a fragment larger than maxLen gets its own chunk.
+func mergeSegments(segs []segment, maxLen int64) []segment {
+	if len(segs) <= 2 {
+		return segs
+	}
+	out := []segment{segs[0]}
+	cur := segs[1]
+	for _, s := range segs[2:] {
+		if s.offset == cur.offset+cur.length && cur.length+s.length <= maxLen {
+			cur.length += s.length
+			continue
+		}
+		out = append(out, cur)
+		cur = s
+	}
+	return append(out, cur)
+}
+
 func scanFMP4Segments(filePath string) []segment {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -1376,6 +1415,9 @@ type mediaMetadata struct {
 	Width      int     `json:"width,omitempty"`
 	Height     int     `json:"height,omitempty"`
 	Duration   float64 `json:"duration,omitempty"`
+	// ChunkFormat 2 means chunks are padded frames (crypto.UnframeChunk).
+	ChunkFormat int    `json:"chunk_format,omitempty"`
+	OwnerTag    string `json:"owner_tag,omitempty"`
 }
 
 func decryptMetadata(item apiMediaItem, publicKey, privKey []byte) (*mediaMetadata, error) {
@@ -1490,6 +1532,23 @@ func sanitizeTerminal(s string) string {
 	return b.String()
 }
 
+// ownerVerified reports whether the item carries a valid owner tag, i.e.
+// was uploaded by this account's own browser or CLI rather than by a
+// delegated app or anyone else who can seal to the public key.
+func ownerVerified(item apiMediaItem, meta *mediaMetadata, masterKey []byte) bool {
+	tag, err := base64.StdEncoding.DecodeString(meta.OwnerTag)
+	if err != nil || len(tag) == 0 {
+		return false
+	}
+	fk, err1 := base64.StdEncoding.DecodeString(item.FileKeySealed)
+	tk, err2 := base64.StdEncoding.DecodeString(item.ThumbKeySealed)
+	mk, err3 := base64.StdEncoding.DecodeString(item.MetadataKeySealed)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return false
+	}
+	return crypto.VerifyOwnerTag(tag, masterKey, item.ID, fk, tk, mk)
+}
+
 func cmdList() {
 	cf, _ := parseConnFlags(os.Args[2:])
 	sess := login(cf)
@@ -1506,15 +1565,24 @@ func cmdList() {
 	}
 
 	fmt.Printf("%-36s  %-8s  %-10s  %s\n", "ID", "TYPE", "SIZE", "NAME")
+	unverified := 0
 	for _, item := range items {
 		meta, err := decryptMetadata(item, sess.publicKey, sess.privKey)
 		if err != nil {
 			fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, "?", "?", "(decryption failed)")
 			continue
 		}
-		fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, sanitizeTerminal(meta.MediaType), formatSize(meta.Size), sanitizeTerminal(meta.Name))
+		name := sanitizeTerminal(meta.Name)
+		if !ownerVerified(item, meta, sess.masterKey) {
+			name += "  [not your upload]"
+			unverified++
+		}
+		fmt.Printf("%-36s  %-8s  %-10s  %s\n", item.ID, sanitizeTerminal(meta.MediaType), formatSize(meta.Size), name)
 	}
 	fmt.Printf("\n%d items total\n", len(items))
+	if unverified > 0 {
+		fmt.Printf("%d marked [not your upload]: added by a connected app, or changed outside your account.\n", unverified)
+	}
 }
 
 // stripPadding extracts the real data from a padded chunk/thumbnail.
@@ -1743,6 +1811,12 @@ func cmdDownload() {
 				io.Copy(io.Discard, io.LimitReader(resp.Body, 20<<20)) // drain padding
 				resp.Body.Close()
 				plaintext, err := crypto.DecryptChunkWith(gcm, encrypted, ci, item.ID)
+				if err == nil && meta.ChunkFormat == crypto.ChunkFormat {
+					// Checks the authenticated last-chunk flag against the
+					// chunk count, so a dropped tail is an error rather than
+					// a silently short file.
+					plaintext, err = crypto.UnframeChunk(plaintext, ci == meta.ChunkCount-1)
+				}
 				if err != nil {
 					res.err = err
 					send(res)

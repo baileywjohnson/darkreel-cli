@@ -339,3 +339,56 @@ func TestModifyPNG_RejectsInvalidInput(t *testing.T) {
 		t.Fatal("non-PNG input should fail")
 	}
 }
+
+func TestFrameChunkBucketsAndRoundTrip(t *testing.T) {
+	key, _ := GenerateFileKey()
+	gcm, _ := NewChunkCipher(key)
+	for _, tc := range []struct {
+		n      int
+		wantCT int
+	}{
+		{0, 1 << 20}, {1, 1 << 20}, {ChunkDataSize, 1 << 20}, {ChunkDataSize + 1, 2 << 20},
+		{3 << 20, 4 << 20}, {17 << 20, 18 << 20},
+	} {
+		data := bytes.Repeat([]byte{0xAB}, tc.n)
+		framed, err := FrameChunk(data, tc.n == 1)
+		if err != nil {
+			t.Fatalf("n=%d: %v", tc.n, err)
+		}
+		ct, _ := EncryptChunkWith(gcm, framed, 3, "m")
+		if len(ct) != tc.wantCT {
+			t.Errorf("n=%d: ciphertext %d bytes, want %d", tc.n, len(ct), tc.wantCT)
+		}
+		plain, err := DecryptChunkWith(gcm, ct, 3, "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnframeChunk(plain, tc.n == 1)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Errorf("n=%d: round trip failed: %v", tc.n, err)
+		}
+		if _, err := UnframeChunk(plain, tc.n != 1); err == nil {
+			t.Errorf("n=%d: last-chunk flag mismatch not detected", tc.n)
+		}
+	}
+	thumb, _ := FrameThumbnail([]byte("jpeg"))
+	if ct, _ := EncryptChunkWith(gcm, thumb, 0, "m"); len(ct) != 256*1024 {
+		t.Errorf("thumbnail ciphertext %d bytes, want 262144", len(ct))
+	}
+}
+
+func TestOwnerTag(t *testing.T) {
+	mk := bytes.Repeat([]byte{7}, 32)
+	fk, tk, mdk := bytes.Repeat([]byte{1}, 92), bytes.Repeat([]byte{2}, 92), bytes.Repeat([]byte{3}, 92)
+	tag, err := OwnerTag(mk, "id-1", fk, tk, mdk)
+	if err != nil || len(tag) != 32 {
+		t.Fatalf("OwnerTag: %v len %d", err, len(tag))
+	}
+	if !VerifyOwnerTag(tag, mk, "id-1", fk, tk, mdk) {
+		t.Error("valid tag rejected")
+	}
+	if VerifyOwnerTag(tag, mk, "id-2", fk, tk, mdk) || VerifyOwnerTag(tag, mk, "id-1", tk, fk, mdk) ||
+		VerifyOwnerTag(tag, bytes.Repeat([]byte{8}, 32), "id-1", fk, tk, mdk) {
+		t.Error("tag verified for a different item, key order or master key")
+	}
+}

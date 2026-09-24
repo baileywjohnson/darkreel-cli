@@ -302,3 +302,17 @@ func TestBuildAuthJSON_EscapesSpecialUsername(t *testing.T) {
 		t.Errorf("username: got %q", parsed["username"])
 	}
 }
+
+func TestMergeSegments(t *testing.T) {
+	segs := []segment{{0, 100}, {100, 300}, {400, 300}, {700, 500}, {1200, 2000}, {3200, 10}}
+	got := mergeSegments(segs, 1000)
+	want := []segment{{0, 100}, {100, 600}, {700, 500}, {1200, 2000}, {3200, 10}}
+	if len(got) != len(want) {
+		t.Fatalf("mergeSegments = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mergeSegments = %v, want %v", got, want)
+		}
+	}
+}
