@@ -247,8 +247,20 @@ func cmdUpload() {
 			resp.Body.Close()
 			fatal("register failed (%d): %s", resp.StatusCode, sanitizeServerResponse(b))
 		}
+		// The server returns the account's recovery code exactly once, here.
+		// It is the only way back in if the password is lost, so show it.
+		var reg struct {
+			RecoveryCode string `json:"recovery_code"`
+		}
+		err = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&reg)
 		resp.Body.Close()
 		fmt.Println("Registered successfully.")
+		if err == nil && reg.RecoveryCode != "" {
+			// Printed to stderr so it isn't captured by scripts piping stdout.
+			fmt.Fprintf(os.Stderr, "\nRecovery code (shown only once — store it somewhere safe; it's the only way back in if you lose your password):\n  %s\n\n", sanitizeTerminal(reg.RecoveryCode))
+		} else {
+			fmt.Fprintln(os.Stderr, "Warning: the server didn't return a recovery code. Change your password once in the web UI to get a new one.")
+		}
 	}
 
 	// Login
@@ -636,6 +648,12 @@ func remuxToFMP4File(filePath, tmpDir string) (string, bool) {
 		"-i", filePath,
 		"-c", "copy",
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		// Cut fragments at least every second, not only at keyframes: with
+		// long keyframe intervals a fragment could be several MB, landing
+		// alone in a 4 or 8 MiB ciphertext bucket. Short fragments pack into
+		// full 1 MiB chunks (mergeSegments). The browser's own remux also
+		// cuts by duration, so the player already handles this.
+		"-frag_duration", "1000000",
 		"-f", "mp4",
 		tmpPath,
 	)

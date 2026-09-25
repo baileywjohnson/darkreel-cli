@@ -6,19 +6,22 @@ Command-line client for [Darkreel](https://github.com/baileywjohnson/darkreel) �
 >
 > - **v0.3.0+** speaks Darkreel **schema v2** (sealed-box uploads, X25519 per-file keys). Required for any Darkreel server released alongside delegated-upload support.
 > - **v0.2.x and earlier** speak **schema v1** only (legacy `file_key_enc` / master-key-wrapped metadata) and will be rejected by v2 servers with `sealed key has wrong length`.
+> - **Unreleased (after v0.3.1)**: uploads in Darkreel **chunk format 2** (padded chunks, `chunk_format: 2` in the encrypted metadata) with an **owner tag**. Viewing those uploads in the browser needs a Darkreel web client that understands chunk format 2; downloads of older (unframed) items still work.
 >
-> The CLI still authenticates with username + `DRK_PASS` (no copy-paste delegation flow — it's your own machine, so full-account access is simpler). What changed in v0.3.0 is the on-wire crypto: per-file `fileKey` / `thumbKey` / `metadataKey` are now generated locally and sealed to the account's X25519 public key, matching what Darkreel's web SPA and PPVDA produce.
+> The CLI still authenticates with username + password (`DRK_PASS` or `-pw-stdin`; no copy-paste delegation flow — it's your own machine, so full-account access is simpler). What changed in v0.3.0 is the on-wire crypto: per-file `fileKey` / `thumbKey` / `metadataKey` are now generated locally and sealed to the account's X25519 public key, matching what Darkreel's web SPA and PPVDA produce.
+>
+> Accounts created by a Darkreel admin must change their password in the web UI before first use — until then the server answers every CLI request with `403 password change required`.
 
 ## Features
 
-- **Upload** -- Encrypt and upload files with Darkreel's schema v2 wire format: per-file `fileKey` / `thumbKey` / `metadataKey` generated locally, sealed to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM), chunks AEAD-encrypted under `fileKey` with media ID + chunk index as AAD
-- **List** -- List all media items with decrypted filenames, types, and sizes (opens sealed metadata keys with the account private key)
-- **Download** -- Download and decrypt media items (parallel chunk fetching, 4 workers, sealed-key opening)
-- **Streaming uploads** -- Chunks are read from disk, encrypted, and streamed to the server one at a time. Only one chunk (~1 MB) is in memory at any time, regardless of file size
+- **Upload** -- Encrypt and upload files with Darkreel's schema v2 wire format: per-file `fileKey` / `thumbKey` / `metadataKey` generated locally, sealed to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM), chunks padded to fixed ciphertext sizes (chunk format 2) and AEAD-encrypted under `fileKey` with media ID + chunk index as AAD
+- **List** -- List all media items with decrypted filenames, types, and sizes (opens sealed metadata keys with the account private key); items without a valid owner tag are marked `[not your upload]`
+- **Download** -- Download and decrypt media items (parallel chunk fetching, 4 workers, sealed-key opening); never overwrites an existing file
+- **Streaming uploads** -- Chunks are read from disk, encrypted, and streamed to the server one at a time. Only one chunk (1 MiB, or one larger video fragment) is in memory at any time, regardless of file size
 - **Thumbnail generation** -- Automatic thumbnails for images (native) and videos (requires ffmpeg)
 - **Hash modification** -- Random metadata injected into file headers before encryption, streaming from disk (only reads a small header, not the full file)
 - **Batch operations** -- Upload or download multiple files in a single command
-- **Account registration** -- Create accounts via CLI with `-register`
+- **Account registration** -- Create accounts via CLI with `-register`; the account's recovery code is printed once (stderr) — store it
 - **Credential hygiene** -- Password accepted via `DRK_PASS` env var or `-pw-stdin` flag (never as a CLI flag value). `-pw-stdin` (v0.3.1+) is preferred in scripts — stdin bytes never enter the process environment, so they're not observable via `/proc/<pid>/environ`. `DRK_PASS` is cleared from the process environment immediately after reading and zeroed in memory after master-key derivation
 
 ## Minimum requirements
@@ -54,7 +57,7 @@ curl -fSL -o darkreel-cli https://github.com/baileywjohnson/darkreel-cli/release
 chmod +x darkreel-cli
 sudo mv darkreel-cli /usr/local/bin/
 
-# Verify checksum (recommended)
+# Verify checksum (detects corrupted downloads; SHA256SUMS is not signed)
 curl -fSL -o SHA256SUMS https://github.com/baileywjohnson/darkreel-cli/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
@@ -88,7 +91,7 @@ darkreel-cli download [flags] [-o DIR] [ID...]
 
 | Flag | Description |
 |------|-------------|
-| `-register` | Register a new account before uploading (requires `ALLOW_REGISTRATION=true` on the server) |
+| `-register` | Register a new account before uploading (requires `ALLOW_REGISTRATION=true` on the server). Prints the account's recovery code once, to stderr — it's the only way back in if the password is lost, so store it |
 
 ### Download flags
 
@@ -96,7 +99,7 @@ darkreel-cli download [flags] [-o DIR] [ID...]
 |------|-------------|
 | `-o` | Output directory (default: current directory) |
 
-If no IDs are specified, all items are downloaded. Downloaded files are created with `0600` permissions (owner-only).
+If no IDs are specified, all items are downloaded. The output directory is created (`0700`) if missing. Downloaded files are created with `0600` permissions (owner-only) and never replace an existing file — if the name is taken the item is saved as `name (1).ext`, etc.
 
 ### Environment variables
 
@@ -152,19 +155,20 @@ DRK_PASS=secret darkreel-cli upload -server https://media.example.com -user alic
 
 ### Upload pipeline
 
-1. Authenticates with the Darkreel server (registers first if `-register` is set)
+1. Authenticates with the Darkreel server (registers first if `-register` is set). As in the web client, the password itself is sent to the server over TLS; the server runs Argon2id on it
 2. Receives the master key encrypted with a PBKDF2-derived session key, decrypts it client-side
-3. Unwraps the account's X25519 private key (AES-256-GCM-encrypted under the master key with user ID as AAD) — needed to open sealed keys during download/list, and carried alongside the master key for the life of the session
+3. Unwraps the account's X25519 private key (AES-256-GCM-encrypted under the master key with user ID as AAD) — needed to open sealed keys during download/list, and carried alongside the master key for the life of the session. The server-supplied public key must match the one derived from that private key, or the CLI aborts (so a hostile server can't make it seal file keys to someone else)
 4. For each file:
-   - **Videos:** Remuxes to fragmented MP4 via ffmpeg (`-c copy`, no re-encoding, written to temp file)
+   - **Videos:** Remuxes to fragmented MP4 via ffmpeg (`-c copy`, no re-encoding, fragments cut at least every second, written to temp file)
    - **Hash modification:** Reads a small header (64 KB) from disk to determine the insertion point, streams the modified file to a temp file — the full file is never loaded into memory
-   - Generates a 320px JPEG thumbnail from the file path (images: native decode, videos: ffmpeg)
-   - Generates three per-file random 256-bit keys — `fileKey`, `thumbKey`, `metadataKey` — and seals each to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM, 92 bytes per sealed key). This matches Darkreel's schema v2 sealed-box protocol, bytes-identical to what the web SPA and PPVDA produce.
-   - Encrypts metadata (name, type, MIME, size, chunk count, codec info) under the dedicated `metadataKey` (not the master key) — keeps metadata-rotation / rename scope-limited to a delegated client that only holds metadata access. Padded to a power-of-2 bucket (minimum 512 bytes) before encryption, preventing blob size from leaking filename length or field presence
-   - Computes segment boundaries — videos at fMP4 moof boundaries (scanned from file headers), other files at 1 MB
-   - Streams the multipart upload via `io.Pipe`: each segment is read from disk, encrypted with AES-256-GCM under `fileKey` (media ID + chunk index as AAD), and written directly to the HTTP request — only one chunk is in memory at a time
+   - Generates a 320px JPEG thumbnail from the file path (images: native decode, videos: ffmpeg), padded inside the encryption so its ciphertext is exactly 256 KiB
+   - Generates three per-file random 256-bit keys — `fileKey`, `thumbKey`, `metadataKey` — and seals each to the account's X25519 public key (X25519-ECDH + HKDF-SHA256 + AES-256-GCM, 92 bytes per sealed key). This matches Darkreel's schema v2 sealed-box protocol — the same format the web SPA and PPVDA produce.
+   - Computes an owner tag (HMAC-SHA256 keyed from the master key over the media ID and the three sealed keys) so Darkreel clients can tell this upload came from the account owner
+   - Encrypts metadata (name, type, MIME, size, chunk count, `chunk_format`, owner tag, codec info) under the dedicated `metadataKey` (not the master key) — keeps metadata-rotation / rename scope-limited to a delegated client that only holds metadata access. Padded to a power-of-2 bucket (minimum 512 bytes) before encryption, preventing blob size from leaking filename length or field presence
+   - Computes segment boundaries — videos at fMP4 moof boundaries (scanned from file headers), with consecutive fragments merged into chunks that fill a 1 MiB ciphertext (a fragment larger than that gets its own chunk); other files in pieces that exactly fill 1 MiB ciphertexts
+   - Streams the multipart upload via `io.Pipe`: each segment is read from disk, wrapped in a format-2 frame (version, last-chunk flag, length, data, zero padding up to a 1/2/4/8/16 MiB ciphertext, then whole MiB), encrypted with AES-256-GCM under `fileKey` (media ID + chunk index as AAD), and written directly to the HTTP request — only one chunk is in memory at a time
 
-The server only ever receives ciphertext blobs and three sealed keys. File names, types, sizes, dimensions, codecs, and all symmetric key material remain opaque to the server.
+The server only ever receives ciphertext blobs and three sealed keys. File names, types, dimensions, codecs, and all symmetric key material remain opaque to the server; it sees the chunk count and each chunk's ciphertext bucket, so the file size is visible only to within those buckets.
 
 Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadata, enabling instant streaming playback in the Darkreel web UI via MediaSource Extensions.
 
@@ -173,13 +177,13 @@ Videos uploaded via the CLI are flagged as `fragmented` in the encrypted metadat
 1. Authenticates, unwraps the X25519 private key, fetches the media list
 2. For each item: opens the sealed `metadataKey` with the private key and decrypts the metadata blob to get the filename, chunk count, etc.; opens the sealed `fileKey` the same way for chunk decryption
 3. Fetches chunks in parallel (4 workers, connection-pooled) via the padded chunk endpoint
-4. Each chunk: strips server-side padding → decrypts with AES-256-GCM under `fileKey` → writes to disk in order
-5. Downloaded files are written through an `os.Root` for the output directory under a sanitized single-component name, and never overwrite an existing file
+4. Each chunk: strips server-side padding → decrypts with AES-256-GCM under `fileKey` → for format-2 items, unframes it and checks the last-chunk flag against the chunk count (a truncated item fails instead of producing a short file) → writes to disk in order
+5. Each item is decrypted into a temp file and published only after every chunk verified, through an `os.Root` for the output directory, under a sanitized single-component name, and never over an existing file
 6. Per-item total-bytes cap of 50 GB guards against a compromised server padding `chunk_count` × 20 MB per chunk into a TB-scale download
 
 ### List
 
-Fetches all media items (paginated), opens each sealed `metadataKey` with the private key, decrypts the metadata blob, and prints a table with ID, type, size, and filename.
+Fetches all media items (paginated), opens each sealed `metadataKey` with the private key, decrypts the metadata blob, and prints a table with ID, type, size, and filename. Items without a valid owner tag — uploaded by a connected app such as PPVDA, or created or changed by anyone else who can seal to your public key — are marked `[not your upload]`.
 
 ## Hash modification
 
@@ -191,7 +195,7 @@ When a file is encrypted, a random 32-byte nonce is injected into the file's met
 | PNG | Inserts a tEXt chunk before IDAT |
 | MP4 | Appends a "free" box at the end of the file |
 
-Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification and are uploaded as-is. Hash modification is also skipped for fMP4-remuxed videos since it would break the container structure. A hash nonce is always generated and sent to the server regardless of format, so the server cannot distinguish modified from unmodified files by the presence or absence of the field.
+Unsupported formats (WebM, MKV, AVI, generic files, etc.) skip hash modification and are uploaded as-is. Hash modification is also skipped for fMP4-remuxed videos since it would break the container structure (so in practice it applies to videos only when ffmpeg is unavailable). The nonce is never sent to the server, so a copy of the database can't link a leaked file back to the account.
 
 ## Supported formats
 
@@ -206,15 +210,16 @@ Video thumbnails and fMP4 remuxing require ffmpeg. If ffmpeg is not available, a
 ## Development
 
 ```bash
-# Run the test suite (crypto round-trips, AAD binding, hash modification,
-# padding buckets, filename sanitization, server response sanitization)
+# Run the test suite (crypto round-trips, AAD layout, chunk framing and
+# bucket sizes, owner tags, hash modification, metadata padding, fragment
+# merging, filename/terminal sanitization, no-clobber downloads, UUID filtering)
 go test ./...
 
 # With verbose output
 go test -v ./...
 ```
 
-The crypto tests verify compatibility with the Darkreel server's protocol — changes to AAD construction, key wrapping, or hash modification that diverge from the server's scheme will be caught here.
+The crypto tests pin the AAD layout, chunk-frame bucket sizes and owner-tag inputs, so accidental changes there fail locally. They don't include known-answer vectors from the Darkreel web client for sealed boxes, PBKDF2 or owner tags — drift in those shows up as failures against a real server.
 
 ## Releasing
 
@@ -225,7 +230,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), and Windows (amd64). Each release includes a `SHA256SUMS` file for verifying binary integrity.
+GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), and Windows (amd64). Each release includes a `SHA256SUMS` file; it is not signed, so it catches corrupted downloads but does not prove a release is authentic.
 
 ## Security
 
@@ -252,7 +257,7 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **HTTP redirect protection** — all HTTP clients disable redirect following, preventing a compromised or MITM'd server from redirecting API requests to leak the Authorization header
 - **Subprocess timeouts** — all ffmpeg and ffprobe invocations have a 10-minute timeout via `exec.CommandContext`, preventing indefinite hangs on malformed or adversarially crafted files
 - **HTTP status validation** — all API responses checked for expected status codes before processing
-- **Temp file isolation** — each upload creates a private temp directory (0700 permissions), cleaned up atomically via `defer`. Temp files use non-identifying names, preventing other users or processes from observing upload activity or file types
+- **Temp file isolation** — each upload creates a private temp directory (0700 permissions) with random file names inside it, removed via `defer` when the upload finishes, so other users can't read remuxed or hash-modified copies
 - **PNG parsing overflow protection** — hash modification for PNG files uses 64-bit arithmetic for chunk length calculations, preventing integer overflow on 32-bit systems and guarding against chunks extending beyond the 64 KB header buffer
 - **Padded chunk format** — uploads use Darkreel chunk format 2: each chunk is padded *inside* the encryption so its ciphertext is exactly 1/2/4/8/16 MB (thumbnails exactly 256 KB), and fMP4 fragments are grouped to fill those buckets. The server and the network see bucket sizes only
 - **Truncation detection** — format-2 chunks carry an encrypted last-chunk flag; downloads fail if the final chunk's flag doesn't match the chunk count, instead of silently writing a short file
@@ -262,7 +267,8 @@ GitHub Actions builds binaries for Linux (amd64, arm64), macOS (amd64, arm64), a
 - **Server-provided IDs validated** — every media item ID from the server must be a canonical UUID; anything else is dropped when the listing is fetched, before use in URLs, AAD, or as a filename fallback
 - **Filename display sanitization** — filenames and types from decrypted metadata are stripped of control characters (including ESC, so no ANSI/OSC sequences) and Unicode bidi overrides before terminal output, in both `list` and `download`
 - **Metadata blob padding** — encrypted metadata blobs are padded to power-of-2 buckets (minimum 512 bytes) before encryption, preventing the encrypted blob size from revealing filename length or which optional fields are present
-- **Hash nonce always sent** — a random 32-byte hash nonce is always generated and sent to the server, even for formats that don't support hash modification. This prevents the server from inferring file format category by the presence or absence of the field
+- **Hash nonce kept local** — the 32-byte nonce embedded by hash modification is never sent to the server, so a stored copy can't link a leaked file back to the account
+- **Public key checked** — the X25519 public key from the login response must match the one derived from the decrypted private key, so a hostile server can't make the CLI seal file keys to an attacker's key
 - **Connection pool tuning** — download HTTP client's `MaxIdleConnsPerHost` matches the worker count (4), ensuring all parallel chunk fetches reuse connections instead of creating new ones
 
 ## Related projects
