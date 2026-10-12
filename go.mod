@@ -1,6 +1,6 @@
 module github.com/baileywjohnson/darkreel-cli
 
-go 1.26.7
+go 1.26.9
 
 require (
 	golang.org/x/crypto v0.57.0
