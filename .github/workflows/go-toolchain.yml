@@ -1,0 +1,84 @@
+name: Go toolchain
+
+on:
+  schedule:
+    # Daily, because Go security releases land on no fixed schedule. Pinning
+    # go.mod (see security.yml) means a new stdlib CVE fails the weekly
+    # Security cron until the `go` directive is bumped; this opens that bump
+    # as a PR first. Dependabot can't: it doesn't update the `go` directive.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-toolchain
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Bump to the latest patch release
+        id: bump
+        run: |
+          current=$(awk '$1 == "go" { print $2; exit }' go.mod)
+          latest=$(.github/scripts/bump-go.sh)
+          if [[ -n $latest ]] && git ls-remote --exit-code --heads origin "go-toolchain/$latest" >/dev/null; then
+            echo "go-toolchain/$latest already exists; leaving it alone."
+            latest=""
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.bump.outputs.latest != ''
+        with:
+          go-version-file: go.mod
+
+      # PRs opened with GITHUB_TOKEN don't trigger other workflows, so
+      # security.yml won't run on the PR. Run the same checks here instead.
+      - name: Verify
+        if: steps.bump.outputs.latest != ''
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
+
+      - name: Open PR
+        if: steps.bump.outputs.latest != ''
+        env:
+          CURRENT: ${{ steps.bump.outputs.current }}
+          LATEST: ${{ steps.bump.outputs.latest }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          branch="go-toolchain/$LATEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "Build on Go $LATEST"
+          git push origin "$branch"
+
+          body="Moves the \`go\` directive from $CURRENT to $LATEST, the newest patch release of the same minor line, with every file that pins it ($(git diff --name-only HEAD~1 | paste -sd, - | sed 's/,/, /g')).
+
+          Release notes: https://go.dev/doc/devel/release#go${LATEST%.*}.minor
+
+          Build, vet, tests and govulncheck passed on Go $LATEST in $RUN_URL. Security won't show as a check here because PRs opened by GITHUB_TOKEN don't trigger workflows; it runs on main after merge.
+
+          Opened by .github/workflows/go-toolchain.yml."
+          url=$(gh pr create --base main --head "$branch" --title "Build on Go $LATEST" --body "$body")
+
+          # Close any PR for an older patch release that this one supersedes.
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"go-toolchain/\")) | select(.headRefName != \"$branch\") | .number" \
+          | while read -r n; do
+              gh pr close "$n" --delete-branch --comment "Superseded by $url"
+            done
